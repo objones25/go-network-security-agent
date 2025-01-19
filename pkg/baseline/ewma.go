@@ -1,16 +1,22 @@
 package baseline
 
 import (
+	"encoding/gob"
 	"math"
 	"sync"
 )
 
+func init() {
+	// Register EWMA type for gob encoding
+	gob.Register(&EWMA{})
+}
+
 // EWMA implements an exponentially weighted moving average
 type EWMA struct {
 	mu    sync.RWMutex
-	alpha float64 // Smoothing factor (0 < alpha <= 1)
-	value float64 // Current EWMA value
-	count int     // Number of samples
+	Alpha float64 // Smoothing factor (0 < alpha <= 1)
+	Value float64 // Current EWMA value
+	Count int     // Number of samples
 }
 
 // NewEWMA creates a new EWMA with the given alpha value
@@ -19,7 +25,7 @@ func NewEWMA(alpha float64) *EWMA {
 		alpha = 0.1 // Default to reasonable value if invalid
 	}
 	return &EWMA{
-		alpha: alpha,
+		Alpha: alpha,
 	}
 }
 
@@ -33,41 +39,41 @@ func (e *EWMA) Update(value float64) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	e.count++
-	if e.count == 1 {
-		e.value = value
+	e.Count++
+	if e.Count == 1 {
+		e.Value = value
 		return
 	}
 
 	// EWMA formula: value = alpha * new_value + (1 - alpha) * old_value
-	e.value = e.alpha*value + (1-e.alpha)*e.value
+	e.Value = e.Alpha*value + (1-e.Alpha)*e.Value
 }
 
 // GetValue returns the current EWMA value
 func (e *EWMA) GetValue() float64 {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	return e.value
+	return e.Value
 }
 
 // Reset resets the EWMA to its initial state
 func (e *EWMA) Reset() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.value = 0
-	e.count = 0
+	e.Value = 0
+	e.Count = 0
 }
 
 // GetCount returns the number of samples processed
 func (e *EWMA) GetCount() int {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	return e.count
+	return e.Count
 }
 
 // GetAlpha returns the smoothing factor
 func (e *EWMA) GetAlpha() float64 {
-	return e.alpha // Immutable after creation, no lock needed
+	return e.Alpha // Immutable after creation, no lock needed
 }
 
 // GetConfidenceBounds returns the confidence bounds for the EWMA
@@ -76,14 +82,14 @@ func (e *EWMA) GetConfidenceBounds(confidence float64) (float64, float64) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
-	if e.count < 2 {
-		return e.value, e.value
+	if e.Count < 2 {
+		return e.Value, e.Value
 	}
 
 	// Calculate standard error
 	// For EWMA, SE = sqrt(alpha/(2-alpha)) * sigma
 	// We'll use a simplified approximation here
-	standardError := math.Sqrt(e.alpha/(2-e.alpha)) * math.Abs(e.value) * 0.1
+	standardError := math.Sqrt(e.Alpha/(2-e.Alpha)) * math.Abs(e.Value) * 0.1
 
 	// Z-score for the confidence interval
 	// 1.96 for 95% confidence, 2.576 for 99% confidence
@@ -93,5 +99,5 @@ func (e *EWMA) GetConfidenceBounds(confidence float64) (float64, float64) {
 	}
 
 	margin := zScore * standardError
-	return e.value - margin, e.value + margin
+	return e.Value - margin, e.Value + margin
 }

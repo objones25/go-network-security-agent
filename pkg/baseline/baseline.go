@@ -2,8 +2,12 @@ package baseline
 
 import (
 	"context"
+	"encoding/gob"
 	"fmt"
+	"log"
 	"math"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -28,6 +32,11 @@ type Config struct {
 
 	// Z-score threshold for anomaly detection
 	AnomalyThreshold float64
+
+	// Persistence configuration
+	PersistenceEnabled bool          // Whether to enable persistence
+	PersistencePath    string        // Directory to store persistence files
+	CheckpointInterval time.Duration // How often to save state
 }
 
 // DefaultConfig returns a default configuration
@@ -40,6 +49,9 @@ func DefaultConfig() Config {
 		MediumTermAlpha:       0.1,  // Balanced weight
 		LongTermAlpha:         0.05, // More weight on history
 		AnomalyThreshold:      3.0,  // 3 standard deviations
+		PersistenceEnabled:    true,
+		PersistencePath:       "data/baseline",
+		CheckpointInterval:    15 * time.Minute,
 	}
 }
 
@@ -64,6 +76,143 @@ type Manager struct {
 	// Channels
 	metricsChan chan capture.StatsSnapshot
 	done        chan struct{}
+
+	// Persistence
+	lastCheckpoint time.Time
+}
+
+// persistedState represents the state to be saved/loaded
+type persistedState struct {
+	StartTime       time.Time
+	SampleCount     int
+	IsInitialized   bool
+	ProtocolStats   map[string]*ProtocolStats
+	HourlyPatterns  map[int]*TimeWindowStats
+	DailyPatterns   map[time.Weekday]*TimeStats
+	MonthlyPatterns map[time.Month]*TimeStats
+	LastCheckpoint  time.Time
+}
+
+func init() {
+	// Register types for gob encoding
+	gob.Register(map[string]*ProtocolStats{})
+	gob.Register(map[int]*TimeWindowStats{})
+	gob.Register(map[time.Weekday]*TimeStats{})
+	gob.Register(map[time.Month]*TimeStats{})
+	gob.Register(&ProtocolStats{})
+	gob.Register(&TimeWindowStats{})
+	gob.Register(&TimeStats{})
+	gob.Register([]uint64{})
+	gob.Register([]time.Time{})
+}
+
+// Save persists the current state to disk
+func (m *Manager) Save() error {
+	if !m.config.PersistenceEnabled {
+		return nil
+	}
+
+	// Create persistence directory if it doesn't exist
+	if err := os.MkdirAll(m.config.PersistencePath, 0755); err != nil {
+		return fmt.Errorf("failed to create persistence directory: %v", err)
+	}
+
+	// Create a temporary file for atomic write
+	tempFile := filepath.Join(m.config.PersistencePath, "baseline.state.tmp")
+	file, err := os.Create(tempFile)
+	if err != nil {
+		return fmt.Errorf("failed to create temporary state file: %v", err)
+	}
+	defer file.Close()
+
+	// Take a snapshot of the state under lock
+	m.mu.RLock()
+	state := persistedState{
+		StartTime:       m.startTime,
+		SampleCount:     m.sampleCount,
+		IsInitialized:   m.isInitialized,
+		ProtocolStats:   m.protocolStats,
+		HourlyPatterns:  m.hourlyPatterns,
+		DailyPatterns:   m.dailyPatterns,
+		MonthlyPatterns: m.monthlyPatterns,
+		LastCheckpoint:  time.Now(),
+	}
+	m.mu.RUnlock()
+
+	// Encode state
+	encoder := gob.NewEncoder(file)
+	if err := encoder.Encode(state); err != nil {
+		return fmt.Errorf("failed to encode state: %v", err)
+	}
+
+	// Ensure data is written to disk
+	if err := file.Sync(); err != nil {
+		return fmt.Errorf("failed to sync state file: %v", err)
+	}
+
+	// Atomically rename temporary file
+	finalPath := filepath.Join(m.config.PersistencePath, "baseline.state")
+	if err := os.Rename(tempFile, finalPath); err != nil {
+		return fmt.Errorf("failed to save state file: %v", err)
+	}
+
+	m.mu.Lock()
+	m.lastCheckpoint = state.LastCheckpoint
+	m.mu.Unlock()
+
+	return nil
+}
+
+// Load restores state from disk
+func (m *Manager) Load() error {
+	if !m.config.PersistenceEnabled {
+		return nil
+	}
+
+	statePath := filepath.Join(m.config.PersistencePath, "baseline.state")
+	file, err := os.Open(statePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // No state file exists yet
+		}
+		return fmt.Errorf("failed to open state file: %v", err)
+	}
+	defer file.Close()
+
+	var state persistedState
+	decoder := gob.NewDecoder(file)
+	if err := decoder.Decode(&state); err != nil {
+		return fmt.Errorf("failed to decode state: %v", err)
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Initialize maps if they don't exist
+	if m.protocolStats == nil {
+		m.protocolStats = make(map[string]*ProtocolStats)
+	}
+	if m.hourlyPatterns == nil {
+		m.hourlyPatterns = make(map[int]*TimeWindowStats)
+	}
+	if m.dailyPatterns == nil {
+		m.dailyPatterns = make(map[time.Weekday]*TimeStats)
+	}
+	if m.monthlyPatterns == nil {
+		m.monthlyPatterns = make(map[time.Month]*TimeStats)
+	}
+
+	// Restore state
+	m.startTime = state.StartTime
+	m.sampleCount = state.SampleCount
+	m.isInitialized = state.IsInitialized
+	m.protocolStats = state.ProtocolStats
+	m.hourlyPatterns = state.HourlyPatterns
+	m.dailyPatterns = state.DailyPatterns
+	m.monthlyPatterns = state.MonthlyPatterns
+	m.lastCheckpoint = state.LastCheckpoint
+
+	return nil
 }
 
 // ProtocolStats holds protocol-specific statistics
@@ -145,6 +294,11 @@ func NewManager(config Config) (*Manager, error) {
 
 // Start begins the baseline learning process
 func (m *Manager) Start(ctx context.Context) error {
+	// Try to load existing state
+	if err := m.Load(); err != nil {
+		return fmt.Errorf("failed to load state: %v", err)
+	}
+
 	go m.run(ctx)
 	return nil
 }
@@ -167,18 +321,36 @@ func (m *Manager) AddMetrics(snapshot capture.StatsSnapshot) {
 // run is the main processing loop
 func (m *Manager) run(ctx context.Context) {
 	ticker := time.NewTicker(m.config.UpdateInterval)
+	var checkpointTicker *time.Ticker
+	if m.config.PersistenceEnabled {
+		checkpointTicker = time.NewTicker(m.config.CheckpointInterval)
+	}
 	defer ticker.Stop()
+	if checkpointTicker != nil {
+		defer checkpointTicker.Stop()
+	}
 
 	for {
 		select {
 		case <-ctx.Done():
+			// Save state before shutting down
+			if err := m.Save(); err != nil {
+				log.Printf("Failed to save state on shutdown: %v", err)
+			}
 			return
 		case <-m.done:
+			if err := m.Save(); err != nil {
+				log.Printf("Failed to save state on shutdown: %v", err)
+			}
 			return
 		case snapshot := <-m.metricsChan:
 			m.processSnapshot(snapshot)
 		case <-ticker.C:
 			m.updateBaselines()
+		case <-checkpointTicker.C:
+			if err := m.Save(); err != nil {
+				log.Printf("Failed to save checkpoint: %v", err)
+			}
 		}
 	}
 }
@@ -318,6 +490,9 @@ func (m *Manager) getOrCreateProtocolStats(protocol string) *ProtocolStats {
 			MediumTermVolume: NewEWMA(m.config.MediumTermAlpha),
 			LongTermVolume:   NewEWMA(m.config.LongTermAlpha),
 			Variance:         NewVarianceTracker(),
+			PacketCounts:     make([]uint64, 0),
+			ByteCounts:       make([]uint64, 0),
+			Timestamps:       make([]time.Time, 0),
 		}
 		m.protocolStats[protocol] = stats
 	}

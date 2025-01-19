@@ -1,11 +1,15 @@
 package unit
 
 import (
+	"context"
 	"math"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/objones25/go-network-security-agent/pkg/baseline"
+	"github.com/objones25/go-network-security-agent/pkg/capture"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -405,5 +409,229 @@ func TestBaselineManager(t *testing.T) {
 			assert.Error(t, err)
 			assert.Nil(t, manager)
 		}
+	})
+}
+
+func TestBaselinePersistence(t *testing.T) {
+	t.Run("Save and Load", func(t *testing.T) {
+		// Create temp directory for test
+		tempDir := t.TempDir()
+
+		// Create manager with persistence enabled
+		config := baseline.DefaultConfig()
+		config.PersistencePath = tempDir
+		config.PersistenceEnabled = true
+		config.CheckpointInterval = time.Second
+
+		manager, err := baseline.NewManager(config)
+		require.NoError(t, err)
+
+		// Start the manager
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		err = manager.Start(ctx)
+		require.NoError(t, err)
+
+		// Add some test data
+		for i := 0; i < 100; i++ {
+			snapshot := capture.StatsSnapshot{
+				TotalPackets: uint64(100 + i),
+				TotalBytes:   uint64(1000 + i*10),
+				PacketsByProtocol: map[string]uint64{
+					"TCP": uint64(80 + i),
+					"UDP": uint64(20),
+				},
+				BytesByProtocol: map[string]uint64{
+					"TCP": uint64(800 + i*10),
+					"UDP": uint64(200),
+				},
+				LastUpdated: time.Now(),
+			}
+			manager.AddMetrics(snapshot)
+		}
+
+		// Wait for metrics to be processed
+		time.Sleep(500 * time.Millisecond)
+
+		// Log original stats before saving
+		for _, proto := range []string{"TCP", "UDP"} {
+			if stats, ok := manager.GetProtocolStats(proto); ok {
+				t.Logf("Before save - Protocol %s: short=%v, medium=%v, long=%v",
+					proto,
+					stats.ShortTermVolume.GetValue(),
+					stats.MediumTermVolume.GetValue(),
+					stats.LongTermVolume.GetValue())
+			} else {
+				t.Logf("Before save - Protocol %s: not found", proto)
+			}
+		}
+
+		// Save state
+		err = manager.Save()
+		require.NoError(t, err)
+
+		// Create new manager and load state
+		newManager, err := baseline.NewManager(config)
+		require.NoError(t, err)
+		err = newManager.Load()
+		require.NoError(t, err)
+
+		// Log loaded stats
+		for _, proto := range []string{"TCP", "UDP"} {
+			if stats, ok := newManager.GetProtocolStats(proto); ok {
+				t.Logf("After load - Protocol %s: short=%v, medium=%v, long=%v",
+					proto,
+					stats.ShortTermVolume.GetValue(),
+					stats.MediumTermVolume.GetValue(),
+					stats.LongTermVolume.GetValue())
+			} else {
+				t.Logf("After load - Protocol %s: not found", proto)
+			}
+		}
+
+		// Verify loaded state matches original
+		assert.Equal(t, manager.IsInitialized(), newManager.IsInitialized())
+
+		// Check protocol stats
+		protocols := []string{"TCP", "UDP"}
+		for _, proto := range protocols {
+			origStats, ok1 := manager.GetProtocolStats(proto)
+			newStats, ok2 := newManager.GetProtocolStats(proto)
+			t.Logf("Protocol %s: ok1=%v, ok2=%v", proto, ok1, ok2)
+			if ok1 && ok2 {
+				t.Logf("Protocol %s stats: orig=%v, new=%v", proto,
+					origStats.ShortTermVolume.GetValue(),
+					newStats.ShortTermVolume.GetValue())
+			}
+			require.True(t, ok1, "Original stats not found for protocol %s", proto)
+			require.True(t, ok2, "Loaded stats not found for protocol %s", proto)
+			assert.InDelta(t, origStats.ShortTermVolume.GetValue(), newStats.ShortTermVolume.GetValue(), 0.0001)
+			assert.InDelta(t, origStats.MediumTermVolume.GetValue(), newStats.MediumTermVolume.GetValue(), 0.0001)
+			assert.InDelta(t, origStats.LongTermVolume.GetValue(), newStats.LongTermVolume.GetValue(), 0.0001)
+		}
+	})
+
+	t.Run("Persistence Disabled", func(t *testing.T) {
+		config := baseline.DefaultConfig()
+		config.PersistenceEnabled = false
+
+		manager, err := baseline.NewManager(config)
+		require.NoError(t, err)
+
+		// Save and load should be no-ops
+		err = manager.Save()
+		assert.NoError(t, err)
+		err = manager.Load()
+		assert.NoError(t, err)
+	})
+
+	t.Run("Invalid Directory", func(t *testing.T) {
+		config := baseline.DefaultConfig()
+		config.PersistenceEnabled = true
+		config.PersistencePath = "/nonexistent/directory/that/should/not/exist"
+
+		manager, err := baseline.NewManager(config)
+		require.NoError(t, err)
+
+		// Save should fail but not panic
+		err = manager.Save()
+		assert.Error(t, err)
+	})
+
+	t.Run("Automatic Checkpointing", func(t *testing.T) {
+		tempDir := t.TempDir()
+
+		config := baseline.DefaultConfig()
+		config.PersistencePath = tempDir
+		config.PersistenceEnabled = true
+		config.CheckpointInterval = 100 * time.Millisecond
+
+		// Create persistence directory
+		err := os.MkdirAll(tempDir, 0755)
+		require.NoError(t, err)
+
+		manager, err := baseline.NewManager(config)
+		require.NoError(t, err)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer cancel()
+
+		err = manager.Start(ctx)
+		require.NoError(t, err)
+
+		// Add metrics
+		for i := 0; i < 10; i++ {
+			snapshot := capture.StatsSnapshot{
+				TotalPackets: uint64(100 + i),
+				TotalBytes:   uint64(1000 + i*10),
+				PacketsByProtocol: map[string]uint64{
+					"TCP": uint64(80 + i),
+				},
+				LastUpdated: time.Now(),
+			}
+			manager.AddMetrics(snapshot)
+			time.Sleep(20 * time.Millisecond)
+		}
+
+		// Wait for checkpoints
+		time.Sleep(300 * time.Millisecond)
+
+		// Verify state file exists
+		_, err = os.Stat(filepath.Join(tempDir, "baseline.state"))
+		assert.NoError(t, err)
+	})
+
+	t.Run("Shutdown_Persistence", func(t *testing.T) {
+		tempDir := t.TempDir()
+
+		config := baseline.DefaultConfig()
+		config.PersistencePath = tempDir
+		config.PersistenceEnabled = true
+
+		// Create persistence directory
+		err := os.MkdirAll(tempDir, 0755)
+		require.NoError(t, err)
+
+		manager, err := baseline.NewManager(config)
+		require.NoError(t, err)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		err = manager.Start(ctx)
+		require.NoError(t, err)
+
+		// Add some metrics
+		snapshot := capture.StatsSnapshot{
+			TotalPackets: 100,
+			TotalBytes:   1000,
+			PacketsByProtocol: map[string]uint64{
+				"TCP": 80,
+			},
+			LastUpdated: time.Now(),
+		}
+		manager.AddMetrics(snapshot)
+
+		// Wait for metrics to be processed
+		time.Sleep(500 * time.Millisecond)
+
+		// Trigger shutdown
+		cancel()
+		time.Sleep(100 * time.Millisecond)
+
+		// Verify state was saved
+		_, err = os.Stat(filepath.Join(tempDir, "baseline.state"))
+		assert.NoError(t, err)
+
+		// Load state in new manager
+		newManager, err := baseline.NewManager(config)
+		require.NoError(t, err)
+		err = newManager.Load()
+		require.NoError(t, err)
+
+		// Verify state was preserved
+		origStats, ok1 := manager.GetProtocolStats("TCP")
+		newStats, ok2 := newManager.GetProtocolStats("TCP")
+		require.True(t, ok1)
+		require.True(t, ok2)
+		assert.InDelta(t, origStats.ShortTermVolume.GetValue(), newStats.ShortTermVolume.GetValue(), 0.0001)
 	})
 }

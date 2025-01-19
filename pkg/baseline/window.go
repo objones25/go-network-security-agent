@@ -1,25 +1,34 @@
 package baseline
 
 import (
+	"encoding/gob"
 	"sync"
 	"time"
 )
+
+func init() {
+	// Register types for gob encoding
+	gob.Register(&TimeWindow{})
+	gob.Register(&WindowManager{})
+	gob.Register(time.Month(1))
+	gob.Register(time.Weekday(0))
+}
 
 // TimeWindow represents a fixed time window for statistics
 type TimeWindow struct {
 	mu sync.RWMutex
 
 	// Window configuration
-	start    time.Time
-	duration time.Duration
+	Start    time.Time
+	Duration time.Duration
 
 	// Statistics
-	packetCount *EWMA
-	byteCount   *EWMA
-	variance    *VarianceTracker
+	PacketCount *EWMA
+	ByteCount   *EWMA
+	Variance    *VarianceTracker
 
 	// Raw data points within window
-	dataPoints []DataPoint
+	DataPoints []DataPoint
 }
 
 // DataPoint represents a single measurement in time
@@ -32,12 +41,12 @@ type DataPoint struct {
 // NewTimeWindow creates a new time window
 func NewTimeWindow(start time.Time, duration time.Duration, alpha float64) *TimeWindow {
 	return &TimeWindow{
-		start:       start,
-		duration:    duration,
-		packetCount: NewEWMA(alpha),
-		byteCount:   NewEWMA(alpha),
-		variance:    NewVarianceTracker(),
-		dataPoints:  make([]DataPoint, 0),
+		Start:       start,
+		Duration:    duration,
+		PacketCount: NewEWMA(alpha),
+		ByteCount:   NewEWMA(alpha),
+		Variance:    NewVarianceTracker(),
+		DataPoints:  make([]DataPoint, 0),
 	}
 }
 
@@ -47,12 +56,12 @@ func (w *TimeWindow) AddDataPoint(point DataPoint) {
 	defer w.mu.Unlock()
 
 	// Update EWMA calculations
-	w.packetCount.Update(float64(point.PacketCount))
-	w.byteCount.Update(float64(point.ByteCount))
-	w.variance.Add(float64(point.PacketCount))
+	w.PacketCount.Update(float64(point.PacketCount))
+	w.ByteCount.Update(float64(point.ByteCount))
+	w.Variance.Add(float64(point.PacketCount))
 
 	// Add to raw data points
-	w.dataPoints = append(w.dataPoints, point)
+	w.DataPoints = append(w.DataPoints, point)
 
 	// Remove old data points outside the window
 	w.pruneOldDataPoints()
@@ -60,15 +69,15 @@ func (w *TimeWindow) AddDataPoint(point DataPoint) {
 
 // pruneOldDataPoints removes data points outside the current window
 func (w *TimeWindow) pruneOldDataPoints() {
-	windowStart := w.start.Add(-w.duration)
+	windowStart := w.Start.Add(-w.Duration)
 	i := 0
-	for ; i < len(w.dataPoints); i++ {
-		if w.dataPoints[i].Timestamp.After(windowStart) {
+	for ; i < len(w.DataPoints); i++ {
+		if w.DataPoints[i].Timestamp.After(windowStart) {
 			break
 		}
 	}
 	if i > 0 {
-		w.dataPoints = w.dataPoints[i:]
+		w.DataPoints = w.DataPoints[i:]
 	}
 }
 
@@ -77,9 +86,9 @@ func (w *TimeWindow) GetStats() (packetRate, byteRate float64, variance float64)
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 
-	packetRate = w.packetCount.GetValue()
-	byteRate = w.byteCount.GetValue()
-	variance = w.variance.GetVariance()
+	packetRate = w.PacketCount.GetValue()
+	byteRate = w.ByteCount.GetValue()
+	variance = w.Variance.GetVariance()
 	return
 }
 
@@ -89,8 +98,8 @@ func (w *TimeWindow) GetDataPoints() []DataPoint {
 	defer w.mu.RUnlock()
 
 	// Return a copy to prevent external modification
-	points := make([]DataPoint, len(w.dataPoints))
-	copy(points, w.dataPoints)
+	points := make([]DataPoint, len(w.DataPoints))
+	copy(points, w.DataPoints)
 	return points
 }
 
@@ -99,13 +108,13 @@ func (w *TimeWindow) IsAnomaly(threshold float64) bool {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 
-	if len(w.dataPoints) < 2 {
+	if len(w.DataPoints) < 2 {
 		return false
 	}
 
 	// Check for anomalies in packet count
-	lastPoint := w.dataPoints[len(w.dataPoints)-1]
-	return w.variance.IsAnomaly(float64(lastPoint.PacketCount), threshold)
+	lastPoint := w.DataPoints[len(w.DataPoints)-1]
+	return w.Variance.IsAnomaly(float64(lastPoint.PacketCount), threshold)
 }
 
 // GetConfidenceBounds returns the confidence bounds for packet and byte rates
@@ -113,8 +122,8 @@ func (w *TimeWindow) GetConfidenceBounds(confidence float64) (packetLower, packe
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 
-	packetLower, packetUpper = w.packetCount.GetConfidenceBounds(confidence)
-	byteLower, byteUpper = w.byteCount.GetConfidenceBounds(confidence)
+	packetLower, packetUpper = w.PacketCount.GetConfidenceBounds(confidence)
+	byteLower, byteUpper = w.ByteCount.GetConfidenceBounds(confidence)
 	return
 }
 
@@ -123,11 +132,11 @@ func (w *TimeWindow) Reset(start time.Time) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	w.start = start
-	w.packetCount.Reset()
-	w.byteCount.Reset()
-	w.variance.Reset()
-	w.dataPoints = w.dataPoints[:0]
+	w.Start = start
+	w.PacketCount.Reset()
+	w.ByteCount.Reset()
+	w.Variance.Reset()
+	w.DataPoints = w.DataPoints[:0]
 }
 
 // WindowManager manages multiple time windows for different time scales
@@ -135,41 +144,41 @@ type WindowManager struct {
 	mu sync.RWMutex
 
 	// Windows for different time scales
-	minuteWindows map[int]*TimeWindow        // 0-59 minutes
-	hourWindows   map[int]*TimeWindow        // 0-23 hours
-	dayWindows    map[int]*TimeWindow        // 0-6 days of week
-	monthWindows  map[time.Month]*TimeWindow // 1-12 months
+	MinuteWindows map[int]*TimeWindow        // 0-59 minutes
+	HourWindows   map[int]*TimeWindow        // 0-23 hours
+	DayWindows    map[int]*TimeWindow        // 0-6 days of week
+	MonthWindows  map[time.Month]*TimeWindow // 1-12 months
 }
 
 // NewWindowManager creates a new window manager
 func NewWindowManager(alpha float64) *WindowManager {
 	wm := &WindowManager{
-		minuteWindows: make(map[int]*TimeWindow),
-		hourWindows:   make(map[int]*TimeWindow),
-		dayWindows:    make(map[int]*TimeWindow),
-		monthWindows:  make(map[time.Month]*TimeWindow),
+		MinuteWindows: make(map[int]*TimeWindow),
+		HourWindows:   make(map[int]*TimeWindow),
+		DayWindows:    make(map[int]*TimeWindow),
+		MonthWindows:  make(map[time.Month]*TimeWindow),
 	}
 
 	now := time.Now()
 
 	// Initialize minute windows
 	for i := 0; i < 60; i++ {
-		wm.minuteWindows[i] = NewTimeWindow(now, time.Minute, alpha)
+		wm.MinuteWindows[i] = NewTimeWindow(now, time.Minute, alpha)
 	}
 
 	// Initialize hour windows
 	for i := 0; i < 24; i++ {
-		wm.hourWindows[i] = NewTimeWindow(now, time.Hour, alpha)
+		wm.HourWindows[i] = NewTimeWindow(now, time.Hour, alpha)
 	}
 
 	// Initialize day windows
 	for i := 0; i < 7; i++ {
-		wm.dayWindows[i] = NewTimeWindow(now, 24*time.Hour, alpha)
+		wm.DayWindows[i] = NewTimeWindow(now, 24*time.Hour, alpha)
 	}
 
 	// Initialize month windows
 	for m := time.January; m <= time.December; m++ {
-		wm.monthWindows[m] = NewTimeWindow(now, 30*24*time.Hour, alpha)
+		wm.MonthWindows[m] = NewTimeWindow(now, 30*24*time.Hour, alpha)
 	}
 
 	return wm
@@ -181,22 +190,22 @@ func (wm *WindowManager) AddDataPoint(point DataPoint) {
 	defer wm.mu.Unlock()
 
 	// Add to minute window
-	if w, ok := wm.minuteWindows[point.Timestamp.Minute()]; ok {
+	if w, ok := wm.MinuteWindows[point.Timestamp.Minute()]; ok {
 		w.AddDataPoint(point)
 	}
 
 	// Add to hour window
-	if w, ok := wm.hourWindows[point.Timestamp.Hour()]; ok {
+	if w, ok := wm.HourWindows[point.Timestamp.Hour()]; ok {
 		w.AddDataPoint(point)
 	}
 
 	// Add to day window
-	if w, ok := wm.dayWindows[int(point.Timestamp.Weekday())]; ok {
+	if w, ok := wm.DayWindows[int(point.Timestamp.Weekday())]; ok {
 		w.AddDataPoint(point)
 	}
 
 	// Add to month window
-	if w, ok := wm.monthWindows[point.Timestamp.Month()]; ok {
+	if w, ok := wm.MonthWindows[point.Timestamp.Month()]; ok {
 		w.AddDataPoint(point)
 	}
 }
@@ -206,10 +215,10 @@ func (wm *WindowManager) GetWindowStats(t time.Time) (minute, hour, day, month *
 	wm.mu.RLock()
 	defer wm.mu.RUnlock()
 
-	minute = wm.minuteWindows[t.Minute()]
-	hour = wm.hourWindows[t.Hour()]
-	day = wm.dayWindows[int(t.Weekday())]
-	month = wm.monthWindows[t.Month()]
+	minute = wm.MinuteWindows[t.Minute()]
+	hour = wm.HourWindows[t.Hour()]
+	day = wm.DayWindows[int(t.Weekday())]
+	month = wm.MonthWindows[t.Month()]
 	return
 }
 
@@ -219,16 +228,16 @@ func (wm *WindowManager) Reset() {
 	defer wm.mu.Unlock()
 
 	now := time.Now()
-	for _, w := range wm.minuteWindows {
+	for _, w := range wm.MinuteWindows {
 		w.Reset(now)
 	}
-	for _, w := range wm.hourWindows {
+	for _, w := range wm.HourWindows {
 		w.Reset(now)
 	}
-	for _, w := range wm.dayWindows {
+	for _, w := range wm.DayWindows {
 		w.Reset(now)
 	}
-	for _, w := range wm.monthWindows {
+	for _, w := range wm.MonthWindows {
 		w.Reset(now)
 	}
 }
