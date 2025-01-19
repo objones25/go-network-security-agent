@@ -1,0 +1,33 @@
+agent:
+  name: "home-network-monitor"
+  interface: "en0"  # Default macOS interface, adjust as needed
+  log_level: "info"
+
+capture:
+  promiscuous: true
+  snapshot_len: 65535
+  timeout: "1s"
+
+baseline:
+  initial_learning_period: "24h"
+  update_interval: "1h"
+  min_samples: 1000
+
+alerts:
+  critical:
+    notification: true
+    desktop: true
+    log: true
+  warning:
+    notification: true
+    desktop: false
+    log: true
+  info:
+    notification: false
+    desktop: false
+    log: true
+
+dashboard:
+  port: 3000
+  metrics_retention: "30d"
+  update_interval: "1s" 
