@@ -69,6 +69,12 @@ func TestRealNetworkTraffic(t *testing.T) {
 		Promiscuous: true,
 		SnapshotLen: 65535,
 		Timeout:     time.Second * 5,
+		SampleRate:  1.0,             // Capture all packets
+		RateLimit:   1000,            // Allow high rate for testing
+		BPFFilter:   "tcp port 8080", // Only capture HTTP test traffic
+		NumWorkers:  4,               // Reasonable number for testing
+		BatchSize:   10,              // Small batches for testing
+		StatsPeriod: time.Second,
 	}
 
 	engine, err := capture.NewPCAPEngine(config)
@@ -81,7 +87,26 @@ func TestRealNetworkTraffic(t *testing.T) {
 
 	err = engine.Start(ctx)
 	if err != nil {
-		t.Fatalf("Failed to start packet capture: %v", err)
+		if err.Error() == "error opening interface lo0: no such device exists" {
+			// Try alternative interface names
+			alternativeInterfaces := []string{"lo", "localhost", "loopback0"}
+			for _, iface := range alternativeInterfaces {
+				config.Interface = iface
+				engine, err = capture.NewPCAPEngine(config)
+				if err != nil {
+					continue
+				}
+				err = engine.Start(ctx)
+				if err == nil {
+					break
+				}
+			}
+			if err != nil {
+				t.Fatalf("Failed to start packet capture on any interface: %v", err)
+			}
+		} else {
+			t.Fatalf("Failed to start packet capture: %v", err)
+		}
 	}
 	defer engine.Stop()
 
@@ -157,6 +182,12 @@ func TestCaptureStress(t *testing.T) {
 		Promiscuous: true,
 		SnapshotLen: 65535,
 		Timeout:     time.Second * 5,
+		SampleRate:  1.0,             // Capture all packets
+		RateLimit:   10000,           // High rate for stress test
+		BPFFilter:   "tcp port 8080", // Only capture HTTP test traffic
+		NumWorkers:  8,               // More workers for stress test
+		BatchSize:   50,              // Larger batches for stress test
+		StatsPeriod: time.Second,
 	}
 
 	engine, err := capture.NewPCAPEngine(config)
@@ -166,7 +197,28 @@ func TestCaptureStress(t *testing.T) {
 	defer cancel()
 
 	err = engine.Start(ctx)
-	assert.NoError(t, err)
+	if err != nil {
+		if err.Error() == "error opening interface lo0: no such device exists" {
+			// Try alternative interface names
+			alternativeInterfaces := []string{"lo", "localhost", "loopback0"}
+			for _, iface := range alternativeInterfaces {
+				config.Interface = iface
+				engine, err = capture.NewPCAPEngine(config)
+				if err != nil {
+					continue
+				}
+				err = engine.Start(ctx)
+				if err == nil {
+					break
+				}
+			}
+			if err != nil {
+				t.Fatalf("Failed to start packet capture on any interface: %v", err)
+			}
+		} else {
+			t.Fatalf("Failed to start packet capture: %v", err)
+		}
+	}
 	defer engine.Stop()
 
 	// Generate continuous traffic

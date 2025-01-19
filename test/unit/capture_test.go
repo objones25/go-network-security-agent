@@ -247,3 +247,136 @@ func TestCombinedRateLimitingAndSampling(t *testing.T) {
 	assert.True(t, rate >= 40 && rate <= 60,
 		"Rate should be between 40.00 and 60.00 packets/sec, got %.2f", rate)
 }
+
+// TestAdaptiveBatchSizing verifies that batch sizes adjust correctly based on performance metrics
+func TestAdaptiveBatchSizing(t *testing.T) {
+	config := capture.Config{
+		Interface:   "lo0",
+		BatchSize:   100,
+		NumWorkers:  2,
+		SampleRate:  1.0,
+		RateLimit:   1000,
+		StatsPeriod: time.Second,
+	}
+
+	engine, err := capture.NewPCAPEngine(config)
+	require.NoError(t, err)
+
+	// Set last adjustment far in the past
+	engine.SetLastAdjustmentTime(time.Now().Add(-3 * time.Second))
+
+	// Record initial batch size
+	initialSize := engine.GetCurrentBatchSize()
+
+	// Test high latency scenario
+	for i := 0; i < 3; i++ {
+		engine.Stats().ProcessingLatency = 100 * time.Millisecond
+		engine.Stats().ChannelBacklog = 500
+		engine.SetLastAdjustmentTime(time.Now().Add(-3 * time.Second))
+		engine.AdjustBatchSize()
+
+		newSize := engine.GetCurrentBatchSize()
+		assert.Less(t, newSize, initialSize,
+			"Batch size should decrease after adjustment %d", i+1)
+		initialSize = newSize
+	}
+
+	// Test low utilization scenario
+	engine.Stats().ProcessingLatency = time.Millisecond
+	engine.Stats().ChannelBacklog = 0
+	engine.Stats().WorkerUtilization = []float64{0.1, 0.1}
+	engine.SetLastAdjustmentTime(time.Now().Add(-3 * time.Second))
+
+	initialSize = engine.GetCurrentBatchSize()
+	engine.AdjustBatchSize()
+
+	newSize := engine.GetCurrentBatchSize()
+	assert.Greater(t, newSize, initialSize,
+		"Batch size should increase under low utilization")
+	assert.Less(t, newSize, initialSize*2,
+		"Batch size increase should be gradual")
+}
+
+// TestMetricsCollection verifies that performance metrics are collected correctly
+func TestMetricsCollection(t *testing.T) {
+	config := capture.Config{
+		Interface:   "lo0",
+		BatchSize:   100,
+		NumWorkers:  2,
+		SampleRate:  1.0,
+		RateLimit:   1000,
+		StatsPeriod: time.Second,
+	}
+
+	engine, err := capture.NewPCAPEngine(config)
+	require.NoError(t, err)
+
+	// Simulate processing metrics
+	start := time.Now().Add(-time.Second) // Set start time 1 second ago
+	engine.UpdateMetrics(start, 100, 50, 0)
+
+	metrics := engine.GetMetrics()
+	require.NotZero(t, metrics["processing_latency_ns"])
+	require.NotZero(t, metrics["batch_latency_ns"])
+	require.Equal(t, 100, metrics["avg_batch_size"])
+	require.Len(t, metrics["worker_utilization"].([]float64), 2)
+
+	// Verify worker utilization calculation
+	utilization := metrics["worker_utilization"].([]float64)[0]
+	require.InDelta(t, 1.0, utilization, 0.1) // Should be close to 100% (1 second active time)
+}
+
+// TestMetricsReset verifies that metrics are properly reset
+func TestMetricsReset(t *testing.T) {
+	config := capture.Config{
+		Interface:  "lo0",
+		BatchSize:  100,
+		NumWorkers: 2,
+	}
+
+	engine, err := capture.NewPCAPEngine(config)
+	require.NoError(t, err)
+
+	// Update some metrics
+	engine.UpdateMetrics(time.Now().Add(-time.Second), 100, 50, 0)
+
+	// Reset stats
+	engine.ResetStats()
+
+	metrics := engine.GetMetrics()
+	assert.Equal(t, int64(0), metrics["processing_latency_ns"])
+	assert.Equal(t, int64(0), metrics["batch_latency_ns"])
+	assert.Equal(t, 0, metrics["channel_backlog"])
+
+	for _, util := range metrics["worker_utilization"].([]float64) {
+		assert.Equal(t, float64(0), util)
+	}
+}
+
+// TestMemoryPooling verifies that packet batch memory is properly pooled and reused
+func TestMemoryPooling(t *testing.T) {
+	config := capture.Config{
+		Interface:   "lo0",
+		BatchSize:   100,
+		NumWorkers:  2,
+		SampleRate:  1.0,
+		RateLimit:   1000,
+		StatsPeriod: time.Second,
+	}
+
+	engine, err := capture.NewPCAPEngine(config)
+	require.NoError(t, err)
+
+	// Get a batch from the pool
+	batch1 := engine.GetBatchFromPool()
+	require.NotNil(t, batch1)
+	require.Equal(t, 0, len(*batch1))
+	require.Equal(t, config.BatchSize*2, cap(*batch1)) // Should have double capacity for growth
+
+	// Return batch to pool
+	engine.ReturnBatchToPool(batch1)
+
+	// Get another batch - should be the same underlying array
+	batch2 := engine.GetBatchFromPool()
+	require.Equal(t, cap(*batch1), cap(*batch2))
+}
