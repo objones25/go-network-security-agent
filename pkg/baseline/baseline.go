@@ -1,0 +1,340 @@
+package baseline
+
+import (
+	"context"
+	"fmt"
+	"math"
+	"sync"
+	"time"
+
+	"github.com/objones25/go-network-security-agent/pkg/capture"
+)
+
+// Config holds configuration for the baseline learning system
+type Config struct {
+	// Initial learning period before generating alerts
+	InitialLearningPeriod time.Duration
+
+	// How often to update baseline calculations
+	UpdateInterval time.Duration
+
+	// Minimum number of samples needed before baseline is considered valid
+	MinSamples int
+
+	// EWMA alpha values for different time scales
+	ShortTermAlpha  float64 // For 5-minute averages
+	MediumTermAlpha float64 // For hourly averages
+	LongTermAlpha   float64 // For daily averages
+
+	// Z-score threshold for anomaly detection
+	AnomalyThreshold float64
+}
+
+// DefaultConfig returns a default configuration
+func DefaultConfig() Config {
+	return Config{
+		InitialLearningPeriod: 24 * time.Hour,
+		UpdateInterval:        time.Hour,
+		MinSamples:            1000,
+		ShortTermAlpha:        0.3,  // More weight on recent values
+		MediumTermAlpha:       0.1,  // Balanced weight
+		LongTermAlpha:         0.05, // More weight on history
+		AnomalyThreshold:      3.0,  // 3 standard deviations
+	}
+}
+
+// Manager handles baseline learning and anomaly detection
+type Manager struct {
+	config Config
+	mu     sync.RWMutex
+
+	// Track learning state
+	startTime     time.Time
+	sampleCount   int
+	isInitialized bool
+
+	// Protocol-specific metrics
+	protocolStats map[string]*ProtocolStats
+
+	// Time-based patterns
+	hourlyPatterns  map[int]*TimeWindowStats    // 0-23 hours
+	dailyPatterns   map[time.Weekday]*TimeStats // Sunday-Saturday
+	monthlyPatterns map[time.Month]*TimeStats   // Jan-Dec
+
+	// Channels
+	metricsChan chan capture.StatsSnapshot
+	done        chan struct{}
+}
+
+// ProtocolStats holds protocol-specific statistics
+type ProtocolStats struct {
+	// EWMA calculations for different time scales
+	ShortTermVolume  *EWMA // 5-minute volume
+	MediumTermVolume *EWMA // Hourly volume
+	LongTermVolume   *EWMA // Daily volume
+
+	// Variance tracking
+	Variance *VarianceTracker
+
+	// Historical data
+	PacketCounts []uint64
+	ByteCounts   []uint64
+	Timestamps   []time.Time
+}
+
+// TimeWindowStats holds statistics for a specific time window
+type TimeWindowStats struct {
+	PacketCount *EWMA
+	ByteCount   *EWMA
+	Variance    *VarianceTracker
+}
+
+// TimeStats holds basic statistics for a time period
+type TimeStats struct {
+	AveragePackets float64
+	AverageBytes   float64
+	StdDevPackets  float64
+	StdDevBytes    float64
+	SampleCount    int
+}
+
+// NewManager creates a new baseline manager
+func NewManager(config Config) (*Manager, error) {
+	if config.InitialLearningPeriod <= 0 {
+		return nil, fmt.Errorf("initial learning period must be positive")
+	}
+	if config.UpdateInterval <= 0 {
+		return nil, fmt.Errorf("update interval must be positive")
+	}
+	if config.MinSamples <= 0 {
+		return nil, fmt.Errorf("minimum samples must be positive")
+	}
+
+	m := &Manager{
+		config:          config,
+		startTime:       time.Now(),
+		protocolStats:   make(map[string]*ProtocolStats),
+		hourlyPatterns:  make(map[int]*TimeWindowStats),
+		dailyPatterns:   make(map[time.Weekday]*TimeStats),
+		monthlyPatterns: make(map[time.Month]*TimeStats),
+		metricsChan:     make(chan capture.StatsSnapshot, 1000),
+		done:            make(chan struct{}),
+	}
+
+	// Initialize hourly patterns
+	for hour := 0; hour < 24; hour++ {
+		m.hourlyPatterns[hour] = &TimeWindowStats{
+			PacketCount: NewEWMA(config.MediumTermAlpha),
+			ByteCount:   NewEWMA(config.MediumTermAlpha),
+			Variance:    NewVarianceTracker(),
+		}
+	}
+
+	// Initialize daily patterns
+	for day := time.Sunday; day <= time.Saturday; day++ {
+		m.dailyPatterns[day] = &TimeStats{}
+	}
+
+	// Initialize monthly patterns
+	for month := time.January; month <= time.December; month++ {
+		m.monthlyPatterns[month] = &TimeStats{}
+	}
+
+	return m, nil
+}
+
+// Start begins the baseline learning process
+func (m *Manager) Start(ctx context.Context) error {
+	go m.run(ctx)
+	return nil
+}
+
+// Stop stops the baseline learning process
+func (m *Manager) Stop() error {
+	close(m.done)
+	return nil
+}
+
+// AddMetrics adds a new metrics snapshot for baseline learning
+func (m *Manager) AddMetrics(snapshot capture.StatsSnapshot) {
+	select {
+	case m.metricsChan <- snapshot:
+	default:
+		// Channel full, skip this update
+	}
+}
+
+// run is the main processing loop
+func (m *Manager) run(ctx context.Context) {
+	ticker := time.NewTicker(m.config.UpdateInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-m.done:
+			return
+		case snapshot := <-m.metricsChan:
+			m.processSnapshot(snapshot)
+		case <-ticker.C:
+			m.updateBaselines()
+		}
+	}
+}
+
+// processSnapshot processes a new metrics snapshot
+func (m *Manager) processSnapshot(snapshot capture.StatsSnapshot) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.sampleCount++
+
+	// Process each protocol
+	for proto, packetCount := range snapshot.PacketsByProtocol {
+		stats := m.getOrCreateProtocolStats(proto)
+		byteCount := snapshot.BytesByProtocol[proto]
+
+		// Update EWMA calculations
+		stats.ShortTermVolume.Update(float64(packetCount))
+		stats.MediumTermVolume.Update(float64(packetCount))
+		stats.LongTermVolume.Update(float64(packetCount))
+
+		// Update variance tracking
+		stats.Variance.Add(float64(packetCount))
+
+		// Store historical data
+		stats.PacketCounts = append(stats.PacketCounts, packetCount)
+		stats.ByteCounts = append(stats.ByteCounts, byteCount)
+		stats.Timestamps = append(stats.Timestamps, snapshot.LastUpdated)
+	}
+
+	// Update time-based patterns
+	hour := snapshot.LastUpdated.Hour()
+	if hourStats, ok := m.hourlyPatterns[hour]; ok {
+		hourStats.PacketCount.Update(float64(snapshot.TotalPackets))
+		hourStats.ByteCount.Update(float64(snapshot.TotalBytes))
+		hourStats.Variance.Add(float64(snapshot.TotalPackets))
+	}
+}
+
+// updateBaselines updates all baseline calculations
+func (m *Manager) updateBaselines() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Check if we've completed initial learning
+	if !m.isInitialized && m.sampleCount >= m.config.MinSamples {
+		m.isInitialized = true
+	}
+
+	// Update time-based patterns
+	m.updateTimePatterns()
+}
+
+// updateTimePatterns updates the time-based pattern statistics
+func (m *Manager) updateTimePatterns() {
+	// Process daily patterns
+	for day := time.Sunday; day <= time.Saturday; day++ {
+		stats := m.dailyPatterns[day]
+		if hourStats, ok := m.hourlyPatterns[int(day)]; ok {
+			packetRate := hourStats.PacketCount.GetValue()
+			byteRate := hourStats.ByteCount.GetValue()
+			variance := hourStats.Variance.GetVariance()
+			stats.AveragePackets = packetRate
+			stats.AverageBytes = byteRate
+			stats.StdDevPackets = math.Sqrt(variance)
+			stats.SampleCount++
+		}
+	}
+
+	// Process monthly patterns
+	now := time.Now()
+	if monthStats, ok := m.monthlyPatterns[now.Month()]; ok {
+		var totalPackets, totalBytes float64
+		var packetSamples, byteSamples []float64
+
+		// Collect data from all hours in the current month
+		for hour := 0; hour < 24; hour++ {
+			if hourStats, ok := m.hourlyPatterns[hour]; ok {
+				packetRate := hourStats.PacketCount.GetValue()
+				byteRate := hourStats.ByteCount.GetValue()
+				totalPackets += packetRate
+				totalBytes += byteRate
+				packetSamples = append(packetSamples, packetRate)
+				byteSamples = append(byteSamples, byteRate)
+			}
+		}
+
+		// Update monthly statistics
+		if len(packetSamples) > 0 {
+			monthStats.AveragePackets = totalPackets / float64(len(packetSamples))
+			monthStats.AverageBytes = totalBytes / float64(len(byteSamples))
+			monthStats.SampleCount = len(packetSamples)
+
+			// Calculate standard deviations
+			var packetSumSq, byteSumSq float64
+			for i := 0; i < len(packetSamples); i++ {
+				diff := packetSamples[i] - monthStats.AveragePackets
+				packetSumSq += diff * diff
+				diff = byteSamples[i] - monthStats.AverageBytes
+				byteSumSq += diff * diff
+			}
+			monthStats.StdDevPackets = math.Sqrt(packetSumSq / float64(len(packetSamples)))
+			monthStats.StdDevBytes = math.Sqrt(byteSumSq / float64(len(byteSamples)))
+		}
+	}
+
+	// Update hourly patterns with adaptive thresholds
+	for hour := 0; hour < 24; hour++ {
+		if hourStats, ok := m.hourlyPatterns[hour]; ok {
+			// Get current hour's stats
+			packetRate := hourStats.PacketCount.GetValue()
+			byteRate := hourStats.ByteCount.GetValue()
+
+			// Adjust thresholds based on time of day
+			isBusinessHour := hour >= 9 && hour <= 17
+			if isBusinessHour {
+				// During business hours, use tighter thresholds
+				hourStats.Variance.Add(packetRate * 0.8) // More weight on current values
+			} else {
+				// During off hours, use looser thresholds
+				hourStats.Variance.Add(packetRate * 1.2) // More tolerance for variation
+			}
+
+			// Update EWMA with current rates
+			hourStats.PacketCount.Update(packetRate)
+			hourStats.ByteCount.Update(byteRate)
+		}
+	}
+}
+
+// getOrCreateProtocolStats gets or creates protocol-specific stats
+func (m *Manager) getOrCreateProtocolStats(protocol string) *ProtocolStats {
+	stats, ok := m.protocolStats[protocol]
+	if !ok {
+		stats = &ProtocolStats{
+			ShortTermVolume:  NewEWMA(m.config.ShortTermAlpha),
+			MediumTermVolume: NewEWMA(m.config.MediumTermAlpha),
+			LongTermVolume:   NewEWMA(m.config.LongTermAlpha),
+			Variance:         NewVarianceTracker(),
+		}
+		m.protocolStats[protocol] = stats
+	}
+	return stats
+}
+
+// IsInitialized returns whether the baseline has completed initial learning
+func (m *Manager) IsInitialized() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.isInitialized
+}
+
+// GetProtocolStats returns statistics for a specific protocol
+func (m *Manager) GetProtocolStats(protocol string) (*ProtocolStats, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	stats, ok := m.protocolStats[protocol]
+	return stats, ok
+}
