@@ -8,3 +8,6 @@
 /data/baseline.state.tmp.*
 test/unit/data/
 test/integration/data/
+
+DS_Store
+.DS_Store

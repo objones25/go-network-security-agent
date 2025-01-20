@@ -1140,3 +1140,174 @@ func TestVarianceTrackerCorrelations(t *testing.T) {
 		assert.Equal(t, 0.0, correlations["temporal_correlation"])
 	})
 }
+
+func TestBaselineHealth(t *testing.T) {
+	t.Run("Initial Health State", func(t *testing.T) {
+		config := baseline.DefaultConfig()
+		manager, err := baseline.NewManager(config)
+		require.NoError(t, err)
+
+		health := manager.GetHealth()
+		assert.Equal(t, 0.0, health.LearningProgress)
+		assert.Equal(t, "", health.LearningPhase)
+		assert.Equal(t, 0, health.DataPoints)
+		assert.Equal(t, 0.0, health.Confidence)
+		assert.Equal(t, 0.0, health.Stability)
+		assert.Equal(t, 0.0, health.Coverage)
+		assert.NotNil(t, health.ProtocolCoverage)
+		assert.False(t, health.LastUpdate.IsZero())
+	})
+
+	t.Run("Health Updates", func(t *testing.T) {
+		config := baseline.DefaultConfig()
+		config.MinSamples = 100 // Smaller value for testing
+		manager, err := baseline.NewManager(config)
+		require.NoError(t, err)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err = manager.Start(ctx)
+		require.NoError(t, err)
+
+		// Add test data
+		for i := 0; i < 50; i++ {
+			snapshot := capture.StatsSnapshot{
+				TotalPackets: uint64(100 + i),
+				TotalBytes:   uint64(1000 + i*10),
+				PacketsByProtocol: map[string]uint64{
+					"TCP": uint64(80 + i),
+					"UDP": uint64(20),
+				},
+				BytesByProtocol: map[string]uint64{
+					"TCP": uint64(800 + i*10),
+					"UDP": uint64(200),
+				},
+				LastUpdated: time.Now(),
+			}
+			manager.AddMetrics(snapshot)
+		}
+
+		// Wait for processing
+		time.Sleep(100 * time.Millisecond)
+
+		// Force health update
+		manager.UpdateHealth()
+
+		health := manager.GetHealth()
+		assert.InDelta(t, 50.0, health.LearningProgress, 1.0)
+		assert.Equal(t, "Active", health.LearningPhase)
+		assert.Greater(t, health.Confidence, 0.0)
+		assert.Greater(t, health.Stability, 0.0)
+		assert.Greater(t, health.Coverage, 0.0)
+		assert.Equal(t, 50, health.DataPoints)
+
+		// Check protocol coverage
+		assert.Contains(t, health.ProtocolCoverage, "TCP")
+		assert.Contains(t, health.ProtocolCoverage, "UDP")
+		assert.Greater(t, health.ProtocolCoverage["TCP"], 0.0)
+		assert.Greater(t, health.ProtocolCoverage["UDP"], 0.0)
+	})
+
+	t.Run("Coverage Calculation", func(t *testing.T) {
+		config := baseline.DefaultConfig()
+		manager, err := baseline.NewManager(config)
+		require.NoError(t, err)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err = manager.Start(ctx)
+		require.NoError(t, err)
+
+		// Add data for specific hours
+		now := time.Now()
+		for hour := 0; hour < 12; hour++ { // Fill half the hours
+			snapshot := capture.StatsSnapshot{
+				TotalPackets: 100,
+				TotalBytes:   1000,
+				PacketsByProtocol: map[string]uint64{
+					"TCP": 80,
+					"UDP": 20,
+				},
+				BytesByProtocol: map[string]uint64{
+					"TCP": 800,
+					"UDP": 200,
+				},
+				LastUpdated: now.Add(time.Duration(hour) * time.Hour),
+			}
+			manager.AddMetrics(snapshot)
+		}
+
+		// Wait for processing
+		time.Sleep(100 * time.Millisecond)
+
+		// Force health update
+		manager.UpdateHealth()
+
+		health := manager.GetHealth()
+		assert.InDelta(t, 0.5, health.Coverage, 0.1) // Should be around 50% coverage
+	})
+
+	t.Run("Stability Calculation", func(t *testing.T) {
+		config := baseline.DefaultConfig()
+		manager, err := baseline.NewManager(config)
+		require.NoError(t, err)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err = manager.Start(ctx)
+		require.NoError(t, err)
+
+		// Add stable data
+		for i := 0; i < 10; i++ {
+			snapshot := capture.StatsSnapshot{
+				TotalPackets: 100, // Constant value
+				TotalBytes:   1000,
+				PacketsByProtocol: map[string]uint64{
+					"TCP": 80,
+				},
+				BytesByProtocol: map[string]uint64{
+					"TCP": 800,
+				},
+				LastUpdated: time.Now(),
+			}
+			manager.AddMetrics(snapshot)
+		}
+
+		// Wait for processing
+		time.Sleep(100 * time.Millisecond)
+
+		// Force health update
+		manager.UpdateHealth()
+
+		health := manager.GetHealth()
+		assert.Greater(t, health.Stability, 0.8) // Should be very stable
+
+		// Add unstable data
+		for i := 0; i < 10; i++ {
+			snapshot := capture.StatsSnapshot{
+				TotalPackets: uint64(100 + i*50), // Varying values
+				TotalBytes:   uint64(1000 + i*500),
+				PacketsByProtocol: map[string]uint64{
+					"TCP": uint64(80 + i*40),
+				},
+				BytesByProtocol: map[string]uint64{
+					"TCP": uint64(800 + i*400),
+				},
+				LastUpdated: time.Now(),
+			}
+			manager.AddMetrics(snapshot)
+		}
+
+		// Wait for processing
+		time.Sleep(100 * time.Millisecond)
+
+		// Force health update
+		manager.UpdateHealth()
+
+		newHealth := manager.GetHealth()
+		assert.Less(t, newHealth.Stability, health.Stability) // Should be less stable
+	})
+}

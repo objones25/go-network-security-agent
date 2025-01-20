@@ -57,6 +57,86 @@ func DefaultConfig() Config {
 	}
 }
 
+// BaselineHealth tracks core health metrics specifically for the baseline component
+type BaselineHealth struct {
+	// Learning State
+	LearningProgress float64   // Progress through initial learning period (0-100%)
+	LearningPhase    string    // Current learning phase (Initial/Active/Stable)
+	DataPoints       int       // Number of data points processed
+	LastUpdate       time.Time // Time of last baseline update
+
+	// Baseline Quality
+	Confidence float64 // Overall confidence in baseline stability (0-1)
+	Stability  float64 // Measure of baseline stability over time (0-1)
+	Coverage   float64 // Data coverage percentage across time windows
+	Maturity   float64 // Baseline maturity score (0-1)
+
+	// Statistical Health
+	MeanStability       float64 // Stability of mean values
+	VarianceStability   float64 // Stability of variance measurements
+	DistributionQuality float64 // Quality of statistical distribution
+	StationarityScore   float64 // Measure of baseline stationarity
+
+	// Temporal Coverage
+	TimeWindowCoverage map[string]float64 // Coverage by time window (hourly/daily/monthly)
+	TemporalStability  float64            // Stability across time periods
+	SeasonalityScore   float64            // Quality of seasonality detection
+	DataFreshness      float64            // Age of most recent data points
+
+	// Protocol Baselines
+	ProtocolCoverage  map[string]float64 // Coverage by protocol
+	ProtocolMaturity  map[string]float64 // Maturity of protocol baselines
+	ProtocolStability map[string]float64 // Stability of protocol baselines
+
+	// Data Quality
+	DataCompleteness float64 // Measure of data completeness (0-1)
+	DataConsistency  float64 // Consistency of incoming data (0-1)
+	GapCount         int     // Number of gaps in baseline data
+	DataQualityTrend float64 // Trend in data quality over time
+}
+
+// BaselineHealthStatus provides a simplified status assessment
+type BaselineHealthStatus struct {
+	Status         string    // Overall status (Learning/Stable/Degraded/Unhealthy)
+	Score          float64   // Normalized health score (0-1)
+	Issues         []string  // List of identified issues
+	LastAssessment time.Time // Time of last health assessment
+
+	// Component Status
+	LearningStatus  string // Status of learning process
+	CoverageStatus  string // Status of data coverage
+	StabilityStatus string // Status of baseline stability
+	QualityStatus   string // Status of data quality
+}
+
+// BaselineHealthThresholds defines acceptable ranges for health metrics
+type BaselineHealthThresholds struct {
+	MinConfidence  float64 // Minimum acceptable confidence
+	MinStability   float64 // Minimum acceptable stability
+	MinCoverage    float64 // Minimum acceptable coverage
+	MinDataQuality float64 // Minimum acceptable data quality
+	MaxDataAge     float64 // Maximum acceptable data age
+	MinTimeWindows int     // Minimum number of time windows
+}
+
+// BaselineHealthConfig provides configuration for health monitoring
+type BaselineHealthConfig struct {
+	AssessmentInterval time.Duration // How often to assess health
+	StabilityWindow    time.Duration // Window for stability calculations
+	MinDataPoints      int           // Minimum data points for assessment
+	CoverageWindows    []string      // Time windows to monitor
+	Thresholds         BaselineHealthThresholds
+}
+
+// HealthAssessor defines the interface for health assessment
+type HealthAssessor interface {
+	AssessHealth() BaselineHealth
+	GetStatus() BaselineHealthStatus
+	IsHealthy() bool
+	GetIssues() []string
+	GetHealth() BaselineHealth
+}
+
 // Manager handles baseline learning and anomaly detection
 type Manager struct {
 	config Config
@@ -81,6 +161,10 @@ type Manager struct {
 
 	// Persistence
 	lastCheckpoint time.Time
+
+	// Health metrics
+	health   *BaselineHealth
+	healthMu sync.RWMutex
 }
 
 // persistedState represents the state to be saved/loaded
@@ -385,6 +469,13 @@ func NewManager(config Config) (*Manager, error) {
 		monthlyPatterns: make(map[time.Month]*TimeStats),
 		metricsChan:     make(chan capture.StatsSnapshot, 1000),
 		done:            make(chan struct{}),
+		health: &BaselineHealth{
+			ProtocolCoverage:   make(map[string]float64),
+			ProtocolMaturity:   make(map[string]float64),
+			ProtocolStability:  make(map[string]float64),
+			TimeWindowCoverage: make(map[string]float64),
+			LastUpdate:         time.Now(),
+		},
 	}
 
 	// Initialize hourly patterns
@@ -442,10 +533,12 @@ func (m *Manager) run(ctx context.Context) {
 	if m.config.PersistenceEnabled {
 		checkpointTicker = time.NewTicker(m.config.CheckpointInterval)
 	}
+	healthTicker := time.NewTicker(time.Minute) // Update health metrics every minute
 	defer ticker.Stop()
 	if checkpointTicker != nil {
 		defer checkpointTicker.Stop()
 	}
+	defer healthTicker.Stop()
 
 	for {
 		select {
@@ -468,6 +561,8 @@ func (m *Manager) run(ctx context.Context) {
 			if err := m.Save(); err != nil {
 				log.Printf("Failed to save checkpoint: %v", err)
 			}
+		case <-healthTicker.C:
+			m.UpdateHealth()
 		}
 	}
 }
@@ -723,4 +818,566 @@ func (ps *ProtocolStats) GetStats() map[string]float64 {
 		"packet_variance":    ps.PacketVariance.GetVariance(),
 		"byte_variance":      ps.ByteVariance.GetVariance(),
 	}
+}
+
+// UpdateHealth updates baseline health metrics
+func (m *Manager) UpdateHealth() {
+	m.healthMu.Lock()
+	defer m.healthMu.Unlock()
+
+	now := time.Now()
+
+	// Calculate learning progress and phase
+	progress := float64(m.sampleCount) / float64(m.config.MinSamples)
+	if progress > 1.0 {
+		progress = 1.0
+	}
+
+	// Determine learning phase
+	var learningPhase string
+	switch {
+	case progress < 0.3:
+		learningPhase = "Initial"
+	case progress < 1.0:
+		learningPhase = "Active"
+	default:
+		learningPhase = "Stable"
+	}
+
+	// Calculate baseline quality metrics
+	stability := m.calculateStability()
+	coverage := m.calculateCoverage()
+	maturity := m.calculateMaturity()
+
+	// Calculate statistical health
+	meanStability := m.calculateMeanStability()
+	varianceStability := m.calculateVarianceStability()
+	distributionQuality := m.calculateDistributionQuality()
+	stationarityScore := m.calculateStationarityScore()
+
+	// Calculate temporal coverage
+	timeWindowCoverage := m.calculateTimeWindowCoverage()
+	temporalStability := m.calculateTemporalStability()
+	seasonalityScore := m.calculateSeasonalityScore()
+	dataFreshness := m.calculateDataFreshness()
+
+	// Calculate protocol metrics
+	protocolCoverage := m.calculateProtocolCoverage()
+	protocolMaturity := m.calculateProtocolMaturity()
+	protocolStability := m.calculateProtocolStability()
+
+	// Calculate data quality metrics
+	dataCompleteness := m.calculateDataCompleteness()
+	dataConsistency := m.calculateDataConsistency()
+	gapCount := m.calculateGapCount()
+	dataQualityTrend := m.calculateDataQualityTrend()
+
+	// Update health metrics
+	m.health.LearningProgress = progress * 100
+	m.health.LearningPhase = learningPhase
+	m.health.DataPoints = m.sampleCount
+	m.health.LastUpdate = now
+
+	m.health.Confidence = (stability + coverage + maturity) / 3.0
+	m.health.Stability = stability
+	m.health.Coverage = coverage
+	m.health.Maturity = maturity
+
+	m.health.MeanStability = meanStability
+	m.health.VarianceStability = varianceStability
+	m.health.DistributionQuality = distributionQuality
+	m.health.StationarityScore = stationarityScore
+
+	m.health.TimeWindowCoverage = timeWindowCoverage
+	m.health.TemporalStability = temporalStability
+	m.health.SeasonalityScore = seasonalityScore
+	m.health.DataFreshness = dataFreshness
+
+	m.health.ProtocolCoverage = protocolCoverage
+	m.health.ProtocolMaturity = protocolMaturity
+	m.health.ProtocolStability = protocolStability
+
+	m.health.DataCompleteness = dataCompleteness
+	m.health.DataConsistency = dataConsistency
+	m.health.GapCount = gapCount
+	m.health.DataQualityTrend = dataQualityTrend
+}
+
+// GetHealthStatus returns the current health status
+func (m *Manager) GetHealthStatus() BaselineHealthStatus {
+	m.healthMu.RLock()
+	defer m.healthMu.RUnlock()
+
+	health := m.health
+	status := BaselineHealthStatus{
+		LastAssessment: time.Now(),
+		Issues:         make([]string, 0),
+	}
+
+	// Determine component status
+	status.LearningStatus = health.LearningPhase
+	status.CoverageStatus = m.determineCoverageStatus()
+	status.StabilityStatus = m.determineStabilityStatus()
+	status.QualityStatus = m.determineQualityStatus()
+
+	// Calculate overall score
+	status.Score = m.calculateOverallScore()
+
+	// Determine overall status
+	status.Status = m.determineOverallStatus(status.Score)
+
+	// Identify issues
+	status.Issues = m.identifyIssues()
+
+	return status
+}
+
+// IsHealthy returns whether the baseline is considered healthy
+func (m *Manager) IsHealthy() bool {
+	status := m.GetHealthStatus()
+	return status.Status == "Stable" || status.Status == "Learning"
+}
+
+// GetIssues returns the current list of health issues
+func (m *Manager) GetIssues() []string {
+	return m.GetHealthStatus().Issues
+}
+
+// Helper functions for health calculations
+
+func (m *Manager) calculateMaturity() float64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.sampleCount == 0 {
+		return 0
+	}
+
+	// Consider multiple factors for maturity
+	learningProgress := float64(m.sampleCount) / float64(m.config.MinSamples)
+	timeProgress := time.Since(m.startTime).Hours() / m.config.InitialLearningPeriod.Hours()
+	stability := m.calculateStability()
+
+	// Combine factors with weights
+	maturity := (learningProgress*0.4 + timeProgress*0.3 + stability*0.3)
+	return math.Min(maturity, 1.0)
+}
+
+func (m *Manager) calculateMeanStability() float64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var totalStability float64
+	var count int
+
+	for _, stats := range m.protocolStats {
+		if stats.ShortTermVolume.GetCount() > 0 {
+			// Calculate stability of mean values over time
+			meanDiff := math.Abs(stats.ShortTermVolume.GetValue() - stats.LongTermVolume.GetValue())
+			meanValue := stats.LongTermVolume.GetValue()
+			if meanValue > 0 {
+				stability := 1.0 / (1.0 + meanDiff/meanValue)
+				totalStability += stability
+				count++
+			}
+		}
+	}
+
+	if count == 0 {
+		return 0
+	}
+	return totalStability / float64(count)
+}
+
+func (m *Manager) calculateVarianceStability() float64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var totalStability float64
+	var count int
+
+	for _, stats := range m.protocolStats {
+		if stats.PacketVariance.GetCount() > 0 {
+			// Calculate stability of variance over time
+			variance := stats.PacketVariance.GetVariance()
+			if variance > 0 {
+				stability := 1.0 / (1.0 + math.Log1p(variance))
+				totalStability += stability
+				count++
+			}
+		}
+	}
+
+	if count == 0 {
+		return 0
+	}
+	return totalStability / float64(count)
+}
+
+func (m *Manager) calculateDistributionQuality() float64 {
+	// Implement distribution quality calculation
+	// This could involve checking for normality, skewness, kurtosis, etc.
+	return 0.0 // Placeholder
+}
+
+func (m *Manager) calculateStationarityScore() float64 {
+	// Implement stationarity calculation
+	// This could involve statistical tests for stationarity
+	return 0.0 // Placeholder
+}
+
+func (m *Manager) calculateTimeWindowCoverage() map[string]float64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	coverage := make(map[string]float64)
+
+	// Calculate hourly coverage
+	activeHours := 0
+	for _, stats := range m.hourlyPatterns {
+		if stats.PacketCount.GetCount() > 0 {
+			activeHours++
+		}
+	}
+	coverage["hourly"] = float64(activeHours) / 24.0
+
+	// Calculate daily coverage
+	activeDays := 0
+	for _, stats := range m.dailyPatterns {
+		if stats.SampleCount > 0 {
+			activeDays++
+		}
+	}
+	coverage["daily"] = float64(activeDays) / 7.0
+
+	// Calculate monthly coverage
+	activeMonths := 0
+	for _, stats := range m.monthlyPatterns {
+		if stats.SampleCount > 0 {
+			activeMonths++
+		}
+	}
+	coverage["monthly"] = float64(activeMonths) / 12.0
+
+	return coverage
+}
+
+func (m *Manager) calculateTemporalStability() float64 {
+	// Calculate stability across different time windows
+	hourlyStability := m.calculateHourlyStability()
+	dailyStability := m.calculateDailyStability()
+	monthlyStability := m.calculateMonthlyStability()
+
+	return (hourlyStability + dailyStability + monthlyStability) / 3.0
+}
+
+func (m *Manager) calculateSeasonalityScore() float64 {
+	// Implement seasonality detection quality calculation
+	return 0.0 // Placeholder
+}
+
+func (m *Manager) calculateDataFreshness() float64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var latestUpdate time.Time
+	for _, stats := range m.protocolStats {
+		if stats.LastUpdated.After(latestUpdate) {
+			latestUpdate = stats.LastUpdated
+		}
+	}
+
+	if latestUpdate.IsZero() {
+		return 0
+	}
+
+	// Convert age to a score between 0 and 1
+	age := time.Since(latestUpdate)
+	maxAge := m.config.UpdateInterval * 2
+	freshness := 1.0 - (age.Seconds() / maxAge.Seconds())
+	return math.Max(0, math.Min(1, freshness))
+}
+
+func (m *Manager) calculateProtocolMaturity() map[string]float64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	maturity := make(map[string]float64)
+	for proto, stats := range m.protocolStats {
+		if stats.ShortTermVolume.GetCount() > 0 {
+			// Calculate maturity based on sample count and stability
+			sampleProgress := float64(stats.ShortTermVolume.GetCount()) / float64(m.config.MinSamples)
+			stability := 1.0 / (1.0 + math.Sqrt(stats.PacketVariance.GetVariance()))
+			maturity[proto] = math.Min(1.0, (sampleProgress*0.7 + stability*0.3))
+		}
+	}
+	return maturity
+}
+
+func (m *Manager) calculateProtocolStability() map[string]float64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	stability := make(map[string]float64)
+	for proto, stats := range m.protocolStats {
+		if stats.ShortTermVolume.GetCount() > 0 {
+			cv := math.Sqrt(stats.PacketVariance.GetVariance()) / stats.ShortTermVolume.GetValue()
+			stability[proto] = 1.0 / (1.0 + cv)
+		}
+	}
+	return stability
+}
+
+func (m *Manager) calculateDataCompleteness() float64 {
+	// Calculate data completeness based on expected vs actual data points
+	expectedPoints := int(time.Since(m.startTime) / m.config.UpdateInterval)
+	if expectedPoints == 0 {
+		return 1.0
+	}
+	return math.Min(1.0, float64(m.sampleCount)/float64(expectedPoints))
+}
+
+func (m *Manager) calculateDataConsistency() float64 {
+	// Implement data consistency calculation
+	return 0.0 // Placeholder
+}
+
+func (m *Manager) calculateGapCount() int {
+	// Implement gap detection
+	return 0 // Placeholder
+}
+
+func (m *Manager) calculateDataQualityTrend() float64 {
+	// Implement data quality trend calculation
+	return 0.0 // Placeholder
+}
+
+func (m *Manager) calculateOverallScore() float64 {
+	health := m.health
+
+	// Weight different components
+	learningWeight := 0.2
+	qualityWeight := 0.3
+	stabilityWeight := 0.3
+	coverageWeight := 0.2
+
+	score := (health.LearningProgress/100.0)*learningWeight +
+		health.Confidence*qualityWeight +
+		health.Stability*stabilityWeight +
+		health.Coverage*coverageWeight
+
+	return score
+}
+
+func (m *Manager) determineOverallStatus(score float64) string {
+	health := m.health
+
+	if health.LearningProgress < 100 {
+		return "Learning"
+	}
+
+	switch {
+	case score >= 0.8:
+		return "Stable"
+	case score >= 0.6:
+		return "Degraded"
+	default:
+		return "Unhealthy"
+	}
+}
+
+func (m *Manager) determineCoverageStatus() string {
+	coverage := m.health.Coverage
+	switch {
+	case coverage >= 0.8:
+		return "Good"
+	case coverage >= 0.5:
+		return "Partial"
+	default:
+		return "Insufficient"
+	}
+}
+
+func (m *Manager) determineStabilityStatus() string {
+	stability := m.health.Stability
+	switch {
+	case stability >= 0.8:
+		return "Stable"
+	case stability >= 0.5:
+		return "Variable"
+	default:
+		return "Unstable"
+	}
+}
+
+func (m *Manager) determineQualityStatus() string {
+	quality := m.health.DataCompleteness * m.health.DataConsistency
+	switch {
+	case quality >= 0.8:
+		return "Good"
+	case quality >= 0.5:
+		return "Fair"
+	default:
+		return "Poor"
+	}
+}
+
+func (m *Manager) identifyIssues() []string {
+	var issues []string
+	health := m.health
+
+	// Check learning progress
+	if health.LearningProgress < 100 {
+		issues = append(issues, fmt.Sprintf("Still learning: %.1f%% complete", health.LearningProgress))
+	}
+
+	// Check coverage
+	if health.Coverage < 0.8 {
+		issues = append(issues, fmt.Sprintf("Insufficient coverage: %.1f%%", health.Coverage*100))
+	}
+
+	// Check stability
+	if health.Stability < 0.7 {
+		issues = append(issues, fmt.Sprintf("Low stability: %.1f%%", health.Stability*100))
+	}
+
+	// Check data quality
+	if health.DataCompleteness < 0.8 {
+		issues = append(issues, fmt.Sprintf("Data completeness issues: %.1f%%", health.DataCompleteness*100))
+	}
+
+	// Check data freshness
+	if health.DataFreshness < 0.8 {
+		issues = append(issues, "Data freshness below threshold")
+	}
+
+	return issues
+}
+
+// calculateStability computes the stability score based on variance
+func (m *Manager) calculateStability() float64 {
+	var totalStability float64
+	var count int
+
+	for _, stats := range m.protocolStats {
+		if stats.ShortTermVolume.GetCount() > 0 {
+			// Calculate coefficient of variation
+			stdDev := math.Sqrt(stats.PacketVariance.GetVariance())
+			mean := stats.ShortTermVolume.GetValue()
+			if mean > 0 {
+				cv := stdDev / mean
+				// Convert to stability score (lower CV = higher stability)
+				stability := 1.0 / (1.0 + cv)
+				totalStability += stability
+				count++
+			}
+		}
+	}
+
+	if count == 0 {
+		return 0
+	}
+	return totalStability / float64(count)
+}
+
+// calculateCoverage computes the data coverage score
+func (m *Manager) calculateCoverage() float64 {
+	var coverage float64
+	totalWindows := 24 // hourly windows
+	activeWindows := 0
+
+	for _, window := range m.hourlyPatterns {
+		if window.PacketCount.GetCount() > 0 {
+			activeWindows++
+		}
+	}
+
+	coverage = float64(activeWindows) / float64(totalWindows)
+	return coverage
+}
+
+// calculateProtocolCoverage computes coverage metrics for each protocol
+func (m *Manager) calculateProtocolCoverage() map[string]float64 {
+	coverage := make(map[string]float64)
+	for proto, stats := range m.protocolStats {
+		if stats.ShortTermVolume.GetCount() > 0 {
+			coverage[proto] = float64(stats.ShortTermVolume.GetCount()) / float64(m.sampleCount)
+		}
+	}
+	return coverage
+}
+
+// calculateHourlyStability computes stability across hourly patterns
+func (m *Manager) calculateHourlyStability() float64 {
+	var totalStability float64
+	var count int
+
+	for _, stats := range m.hourlyPatterns {
+		if stats.PacketCount.GetCount() > 0 {
+			variance := stats.Variance.GetVariance()
+			if variance > 0 {
+				stability := 1.0 / (1.0 + math.Log1p(variance))
+				totalStability += stability
+				count++
+			}
+		}
+	}
+
+	if count == 0 {
+		return 0
+	}
+	return totalStability / float64(count)
+}
+
+// calculateDailyStability computes stability across daily patterns
+func (m *Manager) calculateDailyStability() float64 {
+	var totalStability float64
+	var count int
+
+	for _, stats := range m.dailyPatterns {
+		if stats.SampleCount > 0 {
+			// Use coefficient of variation as stability measure
+			if stats.AveragePackets > 0 {
+				cv := stats.StdDevPackets / stats.AveragePackets
+				stability := 1.0 / (1.0 + cv)
+				totalStability += stability
+				count++
+			}
+		}
+	}
+
+	if count == 0 {
+		return 0
+	}
+	return totalStability / float64(count)
+}
+
+// calculateMonthlyStability computes stability across monthly patterns
+func (m *Manager) calculateMonthlyStability() float64 {
+	var totalStability float64
+	var count int
+
+	for _, stats := range m.monthlyPatterns {
+		if stats.SampleCount > 0 {
+			// Use coefficient of variation as stability measure
+			if stats.AveragePackets > 0 {
+				cv := stats.StdDevPackets / stats.AveragePackets
+				stability := 1.0 / (1.0 + cv)
+				totalStability += stability
+				count++
+			}
+		}
+	}
+
+	if count == 0 {
+		return 0
+	}
+	return totalStability / float64(count)
+}
+
+// GetHealth returns the current baseline health metrics
+func (m *Manager) GetHealth() BaselineHealth {
+	m.healthMu.RLock()
+	defer m.healthMu.RUnlock()
+	return *m.health
 }
