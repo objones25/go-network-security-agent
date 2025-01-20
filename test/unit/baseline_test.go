@@ -635,3 +635,75 @@ func TestBaselinePersistence(t *testing.T) {
 		assert.InDelta(t, origStats.ShortTermVolume.GetValue(), newStats.ShortTermVolume.GetValue(), 0.0001)
 	})
 }
+
+func TestProtocolStats(t *testing.T) {
+	t.Run("Protocol Stats Creation", func(t *testing.T) {
+		config := baseline.DefaultConfig()
+		stats := baseline.NewProtocolStats(config)
+
+		assert.NotNil(t, stats.ShortTermVolume)
+		assert.NotNil(t, stats.ShortTermBytes)
+		assert.NotNil(t, stats.PacketVariance)
+		assert.NotNil(t, stats.ByteVariance)
+		assert.NotNil(t, stats.ConnectionCount)
+		assert.Equal(t, config.AnomalyThreshold, stats.PacketThreshold)
+	})
+
+	t.Run("Stats Update", func(t *testing.T) {
+		config := baseline.DefaultConfig()
+		stats := baseline.NewProtocolStats(config)
+
+		// Add some test data
+		now := time.Now()
+		stats.UpdateStats(100, 1000, now)
+		stats.UpdateStats(150, 1500, now.Add(time.Second))
+		stats.UpdateStats(200, 2000, now.Add(2*time.Second))
+
+		// Check volume metrics
+		assert.Greater(t, stats.ShortTermVolume.GetValue(), 0.0)
+		assert.Greater(t, stats.MediumTermVolume.GetValue(), 0.0)
+		assert.Greater(t, stats.LongTermVolume.GetValue(), 0.0)
+
+		// Check byte metrics
+		assert.Greater(t, stats.ShortTermBytes.GetValue(), 0.0)
+		assert.Greater(t, stats.MediumTermBytes.GetValue(), 0.0)
+		assert.Greater(t, stats.LongTermBytes.GetValue(), 0.0)
+
+		// Check average packet size
+		avgPacketSize := stats.AveragePacketSize.GetValue()
+		assert.InDelta(t, 10.0, avgPacketSize, 1.0) // Each packet is ~10 bytes
+	})
+
+	t.Run("Anomaly Detection", func(t *testing.T) {
+		config := baseline.DefaultConfig()
+		config.AnomalyThreshold = 2.0 // Lower threshold for testing
+		stats := baseline.NewProtocolStats(config)
+
+		// Establish baseline
+		now := time.Now()
+		for i := 0; i < 10; i++ {
+			stats.UpdateStats(100, 1000, now.Add(time.Duration(i)*time.Second))
+		}
+
+		// Test normal traffic
+		assert.False(t, stats.IsAnomaly(110, 1100)) // Within normal range
+
+		// Test anomalous traffic
+		assert.True(t, stats.IsAnomaly(1000, 10000)) // 10x normal
+	})
+
+	t.Run("Stats Retrieval", func(t *testing.T) {
+		config := baseline.DefaultConfig()
+		stats := baseline.NewProtocolStats(config)
+
+		// Add some data
+		now := time.Now()
+		stats.UpdateStats(100, 1000, now)
+
+		// Get stats
+		metrics := stats.GetStats()
+		assert.NotZero(t, metrics["short_term_volume"])
+		assert.NotZero(t, metrics["short_term_bytes"])
+		assert.NotZero(t, metrics["avg_packet_size"])
+	})
+}

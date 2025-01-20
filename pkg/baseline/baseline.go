@@ -222,13 +222,34 @@ type ProtocolStats struct {
 	MediumTermVolume *EWMA // Hourly volume
 	LongTermVolume   *EWMA // Daily volume
 
+	// Byte-level metrics
+	ShortTermBytes  *EWMA // 5-minute bytes
+	MediumTermBytes *EWMA // Hourly bytes
+	LongTermBytes   *EWMA // Daily bytes
+
 	// Variance tracking
-	Variance *VarianceTracker
+	PacketVariance *VarianceTracker // Packet count variance
+	ByteVariance   *VarianceTracker // Byte count variance
+	BurstVariance  *VarianceTracker // Burst size variance
+
+	// Protocol-specific patterns
+	ConnectionCount    *EWMA            // Active connection count
+	AveragePacketSize  *EWMA            // Average packet size
+	BurstDetection     *VarianceTracker // For detecting traffic bursts
+	ConnectionDuration *EWMA            // Average connection duration
 
 	// Historical data
 	PacketCounts []uint64
 	ByteCounts   []uint64
 	Timestamps   []time.Time
+
+	// Protocol-specific thresholds
+	PacketThreshold float64 // Threshold for packet anomalies
+	ByteThreshold   float64 // Threshold for byte anomalies
+	BurstThreshold  float64 // Threshold for burst anomalies
+
+	// Last update timestamp
+	LastUpdated time.Time
 }
 
 // TimeWindowStats holds statistics for a specific time window
@@ -367,18 +388,16 @@ func (m *Manager) processSnapshot(snapshot capture.StatsSnapshot) {
 		stats := m.getOrCreateProtocolStats(proto)
 		byteCount := snapshot.BytesByProtocol[proto]
 
-		// Update EWMA calculations
-		stats.ShortTermVolume.Update(float64(packetCount))
-		stats.MediumTermVolume.Update(float64(packetCount))
-		stats.LongTermVolume.Update(float64(packetCount))
+		// Update all protocol-specific stats
+		stats.UpdateStats(packetCount, byteCount, snapshot.LastUpdated)
 
-		// Update variance tracking
-		stats.Variance.Add(float64(packetCount))
-
-		// Store historical data
-		stats.PacketCounts = append(stats.PacketCounts, packetCount)
-		stats.ByteCounts = append(stats.ByteCounts, byteCount)
-		stats.Timestamps = append(stats.Timestamps, snapshot.LastUpdated)
+		// Check for anomalies if initialized
+		if m.isInitialized {
+			if stats.IsAnomaly(packetCount, byteCount) {
+				log.Printf("Anomaly detected for protocol %s: packets=%d, bytes=%d",
+					proto, packetCount, byteCount)
+			}
+		}
 	}
 
 	// Update time-based patterns
@@ -485,15 +504,7 @@ func (m *Manager) updateTimePatterns() {
 func (m *Manager) getOrCreateProtocolStats(protocol string) *ProtocolStats {
 	stats, ok := m.protocolStats[protocol]
 	if !ok {
-		stats = &ProtocolStats{
-			ShortTermVolume:  NewEWMA(m.config.ShortTermAlpha),
-			MediumTermVolume: NewEWMA(m.config.MediumTermAlpha),
-			LongTermVolume:   NewEWMA(m.config.LongTermAlpha),
-			Variance:         NewVarianceTracker(),
-			PacketCounts:     make([]uint64, 0),
-			ByteCounts:       make([]uint64, 0),
-			Timestamps:       make([]time.Time, 0),
-		}
+		stats = NewProtocolStats(m.config)
 		m.protocolStats[protocol] = stats
 	}
 	return stats
@@ -512,4 +523,108 @@ func (m *Manager) GetProtocolStats(protocol string) (*ProtocolStats, bool) {
 	defer m.mu.RUnlock()
 	stats, ok := m.protocolStats[protocol]
 	return stats, ok
+}
+
+// NewProtocolStats creates a new ProtocolStats instance
+func NewProtocolStats(config Config) *ProtocolStats {
+	return &ProtocolStats{
+		// Volume tracking
+		ShortTermVolume:  NewEWMA(config.ShortTermAlpha),
+		MediumTermVolume: NewEWMA(config.MediumTermAlpha),
+		LongTermVolume:   NewEWMA(config.LongTermAlpha),
+
+		// Byte tracking
+		ShortTermBytes:  NewEWMA(config.ShortTermAlpha),
+		MediumTermBytes: NewEWMA(config.MediumTermAlpha),
+		LongTermBytes:   NewEWMA(config.LongTermAlpha),
+
+		// Variance tracking
+		PacketVariance: NewVarianceTracker(),
+		ByteVariance:   NewVarianceTracker(),
+		BurstVariance:  NewVarianceTracker(),
+
+		// Protocol patterns
+		ConnectionCount:    NewEWMA(config.ShortTermAlpha),
+		AveragePacketSize:  NewEWMA(config.MediumTermAlpha),
+		BurstDetection:     NewVarianceTracker(),
+		ConnectionDuration: NewEWMA(config.MediumTermAlpha),
+
+		// Historical data
+		PacketCounts: make([]uint64, 0),
+		ByteCounts:   make([]uint64, 0),
+		Timestamps:   make([]time.Time, 0),
+
+		// Default thresholds
+		PacketThreshold: config.AnomalyThreshold,
+		ByteThreshold:   config.AnomalyThreshold,
+		BurstThreshold:  config.AnomalyThreshold,
+
+		LastUpdated: time.Now(),
+	}
+}
+
+// UpdateStats updates all statistics for the protocol
+func (ps *ProtocolStats) UpdateStats(packets, bytes uint64, timestamp time.Time) {
+	// Update volume metrics
+	ps.ShortTermVolume.Update(float64(packets))
+	ps.MediumTermVolume.Update(float64(packets))
+	ps.LongTermVolume.Update(float64(packets))
+
+	// Update byte metrics
+	ps.ShortTermBytes.Update(float64(bytes))
+	ps.MediumTermBytes.Update(float64(bytes))
+	ps.LongTermBytes.Update(float64(bytes))
+
+	// Update variance trackers
+	ps.PacketVariance.Add(float64(packets))
+	ps.ByteVariance.Add(float64(bytes))
+
+	// Calculate and update average packet size
+	if packets > 0 {
+		avgPacketSize := float64(bytes) / float64(packets)
+		ps.AveragePacketSize.Update(avgPacketSize)
+	}
+
+	// Update historical data
+	ps.PacketCounts = append(ps.PacketCounts, packets)
+	ps.ByteCounts = append(ps.ByteCounts, bytes)
+	ps.Timestamps = append(ps.Timestamps, timestamp)
+
+	// Update timestamp
+	ps.LastUpdated = timestamp
+}
+
+// IsAnomaly checks if current metrics indicate an anomaly
+func (ps *ProtocolStats) IsAnomaly(packets, bytes uint64) bool {
+	// Check packet count anomaly
+	if ps.PacketVariance.IsAnomaly(float64(packets), ps.PacketThreshold) {
+		return true
+	}
+
+	// Check byte count anomaly
+	if ps.ByteVariance.IsAnomaly(float64(bytes), ps.ByteThreshold) {
+		return true
+	}
+
+	// Check for burst anomaly
+	if ps.BurstVariance.IsAnomaly(float64(packets), ps.BurstThreshold) {
+		return true
+	}
+
+	return false
+}
+
+// GetStats returns current statistics for the protocol
+func (ps *ProtocolStats) GetStats() map[string]float64 {
+	return map[string]float64{
+		"short_term_volume":  ps.ShortTermVolume.GetValue(),
+		"medium_term_volume": ps.MediumTermVolume.GetValue(),
+		"long_term_volume":   ps.LongTermVolume.GetValue(),
+		"short_term_bytes":   ps.ShortTermBytes.GetValue(),
+		"medium_term_bytes":  ps.MediumTermBytes.GetValue(),
+		"long_term_bytes":    ps.LongTermBytes.GetValue(),
+		"avg_packet_size":    ps.AveragePacketSize.GetValue(),
+		"packet_variance":    ps.PacketVariance.GetVariance(),
+		"byte_variance":      ps.ByteVariance.GetVariance(),
+	}
 }
