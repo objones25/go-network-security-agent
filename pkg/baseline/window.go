@@ -14,6 +14,92 @@ func init() {
 	gob.Register(time.Weekday(0))
 }
 
+// CircularBuffer represents a fixed-size circular buffer for DataPoints
+type CircularBuffer struct {
+	Buffer   []DataPoint
+	Head     int  // Points to the next write position
+	Tail     int  // Points to the oldest element
+	Size     int  // Current number of elements
+	Capacity int  // Maximum number of elements
+	IsFull   bool // Indicates if buffer is full
+}
+
+// NewCircularBuffer creates a new circular buffer with given capacity
+func NewCircularBuffer(capacity int) *CircularBuffer {
+	return &CircularBuffer{
+		Buffer:   make([]DataPoint, capacity),
+		Capacity: capacity,
+	}
+}
+
+// Add adds a data point to the circular buffer
+func (cb *CircularBuffer) Add(point DataPoint) {
+	cb.Buffer[cb.Head] = point
+	cb.Head = (cb.Head + 1) % cb.Capacity
+
+	if cb.IsFull {
+		cb.Tail = (cb.Tail + 1) % cb.Capacity
+	} else {
+		cb.Size++
+		if cb.Size == cb.Capacity {
+			cb.IsFull = true
+		}
+	}
+}
+
+// GetPoints returns all valid points within the time window
+func (cb *CircularBuffer) GetPoints(since time.Time) []DataPoint {
+	if cb.Size == 0 {
+		return nil
+	}
+
+	points := make([]DataPoint, 0, cb.Size)
+	idx := cb.Tail
+	count := 0
+
+	for count < cb.Size {
+		if cb.Buffer[idx].Timestamp.After(since) {
+			points = append(points, cb.Buffer[idx])
+		}
+		idx = (idx + 1) % cb.Capacity
+		count++
+	}
+
+	return points
+}
+
+// DataPointPool is a sync.Pool for DataPoint objects
+var DataPointPool = sync.Pool{
+	New: func() interface{} {
+		return &DataPoint{}
+	},
+}
+
+// DataPoint represents a single measurement in time
+type DataPoint struct {
+	Timestamp   time.Time
+	PacketCount uint64
+	ByteCount   uint64
+}
+
+// Reset resets the DataPoint to zero values
+func (dp *DataPoint) Reset() {
+	dp.Timestamp = time.Time{}
+	dp.PacketCount = 0
+	dp.ByteCount = 0
+}
+
+// Put puts a DataPoint back into the pool after resetting it
+func (dp *DataPoint) Put() {
+	dp.Reset()
+	DataPointPool.Put(dp)
+}
+
+// GetDataPoint gets a DataPoint from the pool
+func GetDataPoint() *DataPoint {
+	return DataPointPool.Get().(*DataPoint)
+}
+
 // TimeWindow represents a fixed time window for statistics
 type TimeWindow struct {
 	mu sync.RWMutex
@@ -27,26 +113,26 @@ type TimeWindow struct {
 	ByteCount   *EWMA
 	Variance    *VarianceTracker
 
-	// Raw data points within window
-	DataPoints []DataPoint
-}
-
-// DataPoint represents a single measurement in time
-type DataPoint struct {
-	Timestamp   time.Time
-	PacketCount uint64
-	ByteCount   uint64
+	// Circular buffer for time series data
+	buffer *CircularBuffer
 }
 
 // NewTimeWindow creates a new time window
 func NewTimeWindow(start time.Time, duration time.Duration, alpha float64) *TimeWindow {
+	// Calculate buffer size based on duration and expected data rate
+	// Assuming 1 data point per second as a baseline
+	bufferSize := int(duration.Seconds()) * 2 // Double the size for safety
+	if bufferSize < 100 {
+		bufferSize = 100 // Minimum buffer size
+	}
+
 	return &TimeWindow{
 		Start:       start,
 		Duration:    duration,
 		PacketCount: NewEWMA(alpha),
 		ByteCount:   NewEWMA(alpha),
 		Variance:    NewVarianceTracker(),
-		DataPoints:  make([]DataPoint, 0),
+		buffer:      NewCircularBuffer(bufferSize),
 	}
 }
 
@@ -60,25 +146,8 @@ func (w *TimeWindow) AddDataPoint(point DataPoint) {
 	w.ByteCount.Update(float64(point.ByteCount))
 	w.Variance.Add(float64(point.PacketCount))
 
-	// Add to raw data points
-	w.DataPoints = append(w.DataPoints, point)
-
-	// Remove old data points outside the window
-	w.pruneOldDataPoints()
-}
-
-// pruneOldDataPoints removes data points outside the current window
-func (w *TimeWindow) pruneOldDataPoints() {
-	windowStart := w.Start.Add(-w.Duration)
-	i := 0
-	for ; i < len(w.DataPoints); i++ {
-		if w.DataPoints[i].Timestamp.After(windowStart) {
-			break
-		}
-	}
-	if i > 0 {
-		w.DataPoints = w.DataPoints[i:]
-	}
+	// Add to circular buffer
+	w.buffer.Add(point)
 }
 
 // GetStats returns the current window statistics
@@ -97,34 +166,8 @@ func (w *TimeWindow) GetDataPoints() []DataPoint {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 
-	// Return a copy to prevent external modification
-	points := make([]DataPoint, len(w.DataPoints))
-	copy(points, w.DataPoints)
-	return points
-}
-
-// IsAnomaly checks if the current window contains anomalous behavior
-func (w *TimeWindow) IsAnomaly(threshold float64) bool {
-	w.mu.RLock()
-	defer w.mu.RUnlock()
-
-	if len(w.DataPoints) < 2 {
-		return false
-	}
-
-	// Check for anomalies in packet count
-	lastPoint := w.DataPoints[len(w.DataPoints)-1]
-	return w.Variance.IsAnomaly(float64(lastPoint.PacketCount), threshold)
-}
-
-// GetConfidenceBounds returns the confidence bounds for packet and byte rates
-func (w *TimeWindow) GetConfidenceBounds(confidence float64) (packetLower, packetUpper, byteLower, byteUpper float64) {
-	w.mu.RLock()
-	defer w.mu.RUnlock()
-
-	packetLower, packetUpper = w.PacketCount.GetConfidenceBounds(confidence)
-	byteLower, byteUpper = w.ByteCount.GetConfidenceBounds(confidence)
-	return
+	windowStart := w.Start.Add(-w.Duration)
+	return w.buffer.GetPoints(windowStart)
 }
 
 // Reset resets the window to its initial state
@@ -136,7 +179,31 @@ func (w *TimeWindow) Reset(start time.Time) {
 	w.PacketCount.Reset()
 	w.ByteCount.Reset()
 	w.Variance.Reset()
-	w.DataPoints = w.DataPoints[:0]
+	w.buffer = NewCircularBuffer(w.buffer.Capacity)
+}
+
+// IsAnomaly checks if the current window contains anomalous behavior
+func (w *TimeWindow) IsAnomaly(threshold float64) bool {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+
+	points := w.buffer.GetPoints(w.Start.Add(-w.Duration))
+	if len(points) < 2 {
+		return false
+	}
+
+	lastPoint := points[len(points)-1]
+	return w.Variance.IsAnomaly(float64(lastPoint.PacketCount), threshold)
+}
+
+// GetConfidenceBounds returns the confidence bounds for packet and byte rates
+func (w *TimeWindow) GetConfidenceBounds(confidence float64) (packetLower, packetUpper, byteLower, byteUpper float64) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+
+	packetLower, packetUpper = w.PacketCount.GetConfidenceBounds(confidence)
+	byteLower, byteUpper = w.ByteCount.GetConfidenceBounds(confidence)
+	return
 }
 
 // WindowManager manages multiple time windows for different time scales

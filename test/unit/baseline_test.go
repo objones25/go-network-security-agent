@@ -5,6 +5,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -705,5 +706,239 @@ func TestProtocolStats(t *testing.T) {
 		assert.NotZero(t, metrics["short_term_volume"])
 		assert.NotZero(t, metrics["short_term_bytes"])
 		assert.NotZero(t, metrics["avg_packet_size"])
+	})
+}
+
+// TestCircularBuffer tests the circular buffer implementation
+func TestCircularBuffer(t *testing.T) {
+	t.Run("Basic Operations", func(t *testing.T) {
+		cb := baseline.NewCircularBuffer(5)
+
+		// Test initial state
+		if cb.Size != 0 || cb.IsFull {
+			t.Errorf("New buffer should be empty: Size=%d, IsFull=%v", cb.Size, cb.IsFull)
+		}
+
+		// Add points and verify
+		now := time.Now()
+		points := []baseline.DataPoint{
+			{Timestamp: now, PacketCount: 1, ByteCount: 100},
+			{Timestamp: now.Add(time.Second), PacketCount: 2, ByteCount: 200},
+			{Timestamp: now.Add(2 * time.Second), PacketCount: 3, ByteCount: 300},
+		}
+
+		for _, p := range points {
+			cb.Add(p)
+		}
+
+		if cb.Size != 3 {
+			t.Errorf("Buffer Size should be 3, got %d", cb.Size)
+		}
+
+		// Verify points retrieval
+		retrieved := cb.GetPoints(now.Add(-time.Second))
+		if len(retrieved) != 3 {
+			t.Errorf("Expected 3 points, got %d", len(retrieved))
+		}
+
+		// Verify point values
+		for i, p := range retrieved {
+			if p.PacketCount != uint64(i+1) {
+				t.Errorf("Point %d: expected PacketCount %d, got %d", i, i+1, p.PacketCount)
+			}
+		}
+	})
+
+	t.Run("Buffer Overflow", func(t *testing.T) {
+		cb := baseline.NewCircularBuffer(3)
+		now := time.Now()
+
+		// Add more points than capacity
+		for i := 0; i < 5; i++ {
+			cb.Add(baseline.DataPoint{
+				Timestamp:   now.Add(time.Duration(i) * time.Second),
+				PacketCount: uint64(i + 1),
+				ByteCount:   uint64(i * 100),
+			})
+		}
+
+		// Verify buffer maintains only latest 3 points
+		points := cb.GetPoints(now.Add(-time.Hour))
+		if len(points) != 3 {
+			t.Errorf("Expected 3 points after overflow, got %d", len(points))
+		}
+
+		// Verify the correct points were kept (should be 3,4,5)
+		for i, p := range points {
+			expected := uint64(i + 3)
+			if p.PacketCount != expected {
+				t.Errorf("Point %d: expected PacketCount %d, got %d", i, expected, p.PacketCount)
+			}
+		}
+	})
+
+	t.Run("Time Window Filtering", func(t *testing.T) {
+		cb := baseline.NewCircularBuffer(5)
+		now := time.Now()
+
+		// Add points at different times
+		points := []baseline.DataPoint{
+			{Timestamp: now.Add(-2 * time.Hour), PacketCount: 1},
+			{Timestamp: now.Add(-1 * time.Hour), PacketCount: 2},
+			{Timestamp: now, PacketCount: 3},
+			{Timestamp: now.Add(time.Hour), PacketCount: 4},
+		}
+
+		for _, p := range points {
+			cb.Add(p)
+		}
+
+		// Get points after a certain time
+		retrieved := cb.GetPoints(now.Add(-30 * time.Minute))
+		if len(retrieved) != 2 {
+			t.Errorf("Expected 2 points within time window, got %d", len(retrieved))
+		}
+
+		if retrieved[0].PacketCount != 3 || retrieved[1].PacketCount != 4 {
+			t.Errorf("Incorrect points retrieved: got %v", retrieved)
+		}
+	})
+}
+
+// TestDataPointPooling tests the DataPoint memory pool
+func TestDataPointPooling(t *testing.T) {
+	t.Run("Pool Reuse", func(t *testing.T) {
+		// Get a point from the pool
+		point1 := baseline.GetDataPoint()
+		point1.PacketCount = 100
+		point1.ByteCount = 1000
+		point1.Timestamp = time.Now()
+
+		// Put it back using the new Put method
+		point1.Put()
+
+		// Get another point
+		point2 := baseline.GetDataPoint()
+
+		// Verify we got a clean object (values should be zero)
+		if point2.PacketCount != 0 || point2.ByteCount != 0 || !point2.Timestamp.IsZero() {
+			t.Errorf("Pool should return clean objects, got PacketCount=%d, ByteCount=%d, Timestamp=%v",
+				point2.PacketCount, point2.ByteCount, point2.Timestamp)
+		}
+
+		// Clean up
+		point2.Put()
+	})
+
+	t.Run("Concurrent Pool Access", func(t *testing.T) {
+		var wg sync.WaitGroup
+		numGoroutines := 100
+		pointsPerGoroutine := 1000
+
+		wg.Add(numGoroutines)
+		for i := 0; i < numGoroutines; i++ {
+			go func() {
+				defer wg.Done()
+				for j := 0; j < pointsPerGoroutine; j++ {
+					point := baseline.GetDataPoint()
+					point.PacketCount = uint64(j)
+					point.ByteCount = uint64(j * 100)
+					point.Timestamp = time.Now()
+					point.Put() // Use new Put method
+				}
+			}()
+		}
+
+		wg.Wait()
+	})
+}
+
+// BenchmarkCircularBuffer benchmarks the circular buffer operations
+func BenchmarkCircularBuffer(b *testing.B) {
+	b.Run("Sequential Add", func(b *testing.B) {
+		cb := baseline.NewCircularBuffer(1000)
+		now := time.Now()
+
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			cb.Add(baseline.DataPoint{
+				Timestamp:   now.Add(time.Duration(i) * time.Second),
+				PacketCount: uint64(i),
+				ByteCount:   uint64(i * 100),
+			})
+		}
+	})
+
+	b.Run("Add and GetPoints", func(b *testing.B) {
+		cb := baseline.NewCircularBuffer(1000)
+		now := time.Now()
+
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			cb.Add(baseline.DataPoint{
+				Timestamp:   now.Add(time.Duration(i) * time.Second),
+				PacketCount: uint64(i),
+				ByteCount:   uint64(i * 100),
+			})
+
+			if i%100 == 0 {
+				cb.GetPoints(now)
+			}
+		}
+	})
+}
+
+// BenchmarkTimeWindow benchmarks the TimeWindow operations with the new optimizations
+func BenchmarkTimeWindow(b *testing.B) {
+	b.Run("AddDataPoint", func(b *testing.B) {
+		window := baseline.NewTimeWindow(time.Now(), time.Hour, 0.1)
+		now := time.Now()
+
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			window.AddDataPoint(baseline.DataPoint{
+				Timestamp:   now.Add(time.Duration(i) * time.Second),
+				PacketCount: uint64(i),
+				ByteCount:   uint64(i * 100),
+			})
+		}
+	})
+
+	b.Run("GetStats", func(b *testing.B) {
+		window := baseline.NewTimeWindow(time.Now(), time.Hour, 0.1)
+		now := time.Now()
+
+		// Add some initial data
+		for i := 0; i < 1000; i++ {
+			window.AddDataPoint(baseline.DataPoint{
+				Timestamp:   now.Add(time.Duration(i) * time.Second),
+				PacketCount: uint64(i),
+				ByteCount:   uint64(i * 100),
+			})
+		}
+
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			window.GetStats()
+		}
+	})
+
+	b.Run("IsAnomaly", func(b *testing.B) {
+		window := baseline.NewTimeWindow(time.Now(), time.Hour, 0.1)
+		now := time.Now()
+
+		// Add some initial data
+		for i := 0; i < 1000; i++ {
+			window.AddDataPoint(baseline.DataPoint{
+				Timestamp:   now.Add(time.Duration(i) * time.Second),
+				PacketCount: uint64(i),
+				ByteCount:   uint64(i * 100),
+			})
+		}
+
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			window.IsAnomaly(2.0)
+		}
 	})
 }
