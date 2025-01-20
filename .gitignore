@@ -1,0 +1,10 @@
+/data/
+
+.env
+
+/data/baseline.state
+
+/data/baseline.state.tmp
+/data/baseline.state.tmp.*
+test/unit/data/
+test/integration/data/

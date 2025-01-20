@@ -420,7 +420,7 @@ func TestBaselinePersistence(t *testing.T) {
 
 		// Create manager with persistence enabled
 		config := baseline.DefaultConfig()
-		config.PersistencePath = tempDir
+		config.PersistencePath = tempDir // Use tempDir directly without subdirectories
 		config.PersistenceEnabled = true
 		config.CheckpointInterval = time.Second
 
@@ -471,6 +471,10 @@ func TestBaselinePersistence(t *testing.T) {
 		err = manager.Save()
 		require.NoError(t, err)
 
+		// Verify state file exists
+		_, err = os.Stat(filepath.Join(tempDir, "baseline.state"))
+		require.NoError(t, err, "State file should exist")
+
 		// Create new manager and load state
 		newManager, err := baseline.NewManager(config)
 		require.NoError(t, err)
@@ -510,6 +514,10 @@ func TestBaselinePersistence(t *testing.T) {
 			assert.InDelta(t, origStats.MediumTermVolume.GetValue(), newStats.MediumTermVolume.GetValue(), 0.0001)
 			assert.InDelta(t, origStats.LongTermVolume.GetValue(), newStats.LongTermVolume.GetValue(), 0.0001)
 		}
+
+		// Ensure cleanup by stopping managers
+		cancel()
+		time.Sleep(100 * time.Millisecond)
 	})
 
 	t.Run("Persistence Disabled", func(t *testing.T) {
@@ -542,6 +550,10 @@ func TestBaselinePersistence(t *testing.T) {
 	t.Run("Automatic Checkpointing", func(t *testing.T) {
 		// Create temp directory for test
 		tempDir := t.TempDir()
+
+		// Ensure the directory exists with proper permissions
+		err := os.MkdirAll(tempDir, 0755)
+		require.NoError(t, err)
 
 		config := baseline.DefaultConfig()
 		config.PersistencePath = tempDir

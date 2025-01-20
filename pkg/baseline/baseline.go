@@ -1,9 +1,11 @@
 package baseline
 
 import (
+	"bytes"
 	"context"
 	"encoding/gob"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"os"
@@ -106,24 +108,73 @@ func init() {
 	gob.Register([]time.Time{})
 }
 
+// validateState performs basic validation of loaded state
+func validateState(state *persistedState) error {
+	if state == nil {
+		return fmt.Errorf("nil state")
+	}
+
+	// Validate maps are initialized
+	if state.ProtocolStats == nil {
+		return fmt.Errorf("nil protocol stats")
+	}
+	if state.HourlyPatterns == nil {
+		return fmt.Errorf("nil hourly patterns")
+	}
+	if state.DailyPatterns == nil {
+		return fmt.Errorf("nil daily patterns")
+	}
+	if state.MonthlyPatterns == nil {
+		return fmt.Errorf("nil monthly patterns")
+	}
+
+	// Validate sample count
+	if state.SampleCount < 0 {
+		return fmt.Errorf("invalid sample count: %d", state.SampleCount)
+	}
+
+	// Validate timestamps
+	if state.StartTime.IsZero() {
+		return fmt.Errorf("invalid start time")
+	}
+	if state.LastCheckpoint.IsZero() {
+		return fmt.Errorf("invalid last checkpoint time")
+	}
+
+	return nil
+}
+
 // Save persists the current state to disk
 func (m *Manager) Save() error {
 	if !m.config.PersistenceEnabled {
 		return nil
 	}
 
-	// Create persistence directory if it doesn't exist
+	// Create persistence directory with all parent directories
 	if err := os.MkdirAll(m.config.PersistencePath, 0755); err != nil {
 		return fmt.Errorf("failed to create persistence directory: %v", err)
 	}
 
-	// Create a temporary file for atomic write
-	tempFile := filepath.Join(m.config.PersistencePath, "baseline.state.tmp")
-	file, err := os.Create(tempFile)
+	// Verify directory exists and is writable
+	if err := verifyDirectoryAccess(m.config.PersistencePath); err != nil {
+		return fmt.Errorf("persistence directory access error: %v", err)
+	}
+
+	// Create a temporary file in the same directory
+	tempFile := filepath.Join(m.config.PersistencePath, fmt.Sprintf("baseline.state.tmp.%d", time.Now().UnixNano()))
+	file, err := os.OpenFile(tempFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
 		return fmt.Errorf("failed to create temporary state file: %v", err)
 	}
-	defer file.Close()
+
+	// Ensure cleanup of temporary file in case of errors
+	removeTemp := true
+	defer func() {
+		file.Close()
+		if removeTemp {
+			os.Remove(tempFile)
+		}
+	}()
 
 	// Take a snapshot of the state under lock
 	m.mu.RLock()
@@ -150,15 +201,48 @@ func (m *Manager) Save() error {
 		return fmt.Errorf("failed to sync state file: %v", err)
 	}
 
+	// Close the file before renaming
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("failed to close temporary file: %v", err)
+	}
+
 	// Atomically rename temporary file
 	finalPath := filepath.Join(m.config.PersistencePath, "baseline.state")
 	if err := os.Rename(tempFile, finalPath); err != nil {
 		return fmt.Errorf("failed to save state file: %v", err)
 	}
 
+	// Successfully renamed, don't remove the temp file
+	removeTemp = false
+
 	m.mu.Lock()
 	m.lastCheckpoint = state.LastCheckpoint
 	m.mu.Unlock()
+
+	return nil
+}
+
+// verifyDirectoryAccess checks if a directory exists and is writable
+func verifyDirectoryAccess(dir string) error {
+	// Check if directory exists
+	info, err := os.Stat(dir)
+	if err != nil {
+		return fmt.Errorf("failed to stat directory: %v", err)
+	}
+
+	// Check if it's a directory
+	if !info.IsDir() {
+		return fmt.Errorf("path is not a directory")
+	}
+
+	// Check if directory is writable by attempting to create a temporary file
+	testFile := filepath.Join(dir, fmt.Sprintf(".test.%d", time.Now().UnixNano()))
+	f, err := os.OpenFile(testFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		return fmt.Errorf("directory is not writable: %v", err)
+	}
+	f.Close()
+	os.Remove(testFile)
 
 	return nil
 }
@@ -170,7 +254,7 @@ func (m *Manager) Load() error {
 	}
 
 	statePath := filepath.Join(m.config.PersistencePath, "baseline.state")
-	file, err := os.Open(statePath)
+	file, err := os.OpenFile(statePath, os.O_RDONLY, 0600)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil // No state file exists yet
@@ -179,10 +263,22 @@ func (m *Manager) Load() error {
 	}
 	defer file.Close()
 
+	// Read entire file content
+	content, err := io.ReadAll(file)
+	if err != nil {
+		return fmt.Errorf("failed to read state file: %v", err)
+	}
+
+	// Decode state
 	var state persistedState
-	decoder := gob.NewDecoder(file)
+	decoder := gob.NewDecoder(bytes.NewReader(content))
 	if err := decoder.Decode(&state); err != nil {
 		return fmt.Errorf("failed to decode state: %v", err)
+	}
+
+	// Validate loaded state
+	if err := validateState(&state); err != nil {
+		return fmt.Errorf("invalid state loaded: %v", err)
 	}
 
 	m.mu.Lock()
