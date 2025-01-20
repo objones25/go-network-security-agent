@@ -540,6 +540,7 @@ func TestBaselinePersistence(t *testing.T) {
 	})
 
 	t.Run("Automatic Checkpointing", func(t *testing.T) {
+		// Create temp directory for test
 		tempDir := t.TempDir()
 
 		config := baseline.DefaultConfig()
@@ -547,13 +548,10 @@ func TestBaselinePersistence(t *testing.T) {
 		config.PersistenceEnabled = true
 		config.CheckpointInterval = 100 * time.Millisecond
 
-		// Create persistence directory
-		err := os.MkdirAll(tempDir, 0755)
-		require.NoError(t, err)
-
 		manager, err := baseline.NewManager(config)
 		require.NoError(t, err)
 
+		// Create context with timeout
 		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 		defer cancel()
 
@@ -574,12 +572,15 @@ func TestBaselinePersistence(t *testing.T) {
 			time.Sleep(20 * time.Millisecond)
 		}
 
-		// Wait for checkpoints
+		// Wait for checkpoints and ensure manager is stopped
 		time.Sleep(300 * time.Millisecond)
+		cancel()
+		time.Sleep(100 * time.Millisecond) // Give time for cleanup
 
 		// Verify state file exists
-		_, err = os.Stat(filepath.Join(tempDir, "baseline.state"))
-		assert.NoError(t, err)
+		stateFile := filepath.Join(tempDir, "baseline.state")
+		_, err = os.Stat(stateFile)
+		assert.NoError(t, err, "State file should exist at %s", stateFile)
 	})
 
 	t.Run("Shutdown_Persistence", func(t *testing.T) {
@@ -940,5 +941,190 @@ func BenchmarkTimeWindow(b *testing.B) {
 		for i := 0; i < b.N; i++ {
 			window.IsAnomaly(2.0)
 		}
+	})
+}
+
+func TestCorrelationTracker(t *testing.T) {
+	t.Run("Basic Correlation", func(t *testing.T) {
+		ct := baseline.NewCorrelationTracker()
+
+		// Perfect positive correlation
+		for i := 0; i < 10; i++ {
+			ct.Add(float64(i), float64(i))
+		}
+		assert.InDelta(t, 1.0, ct.GetCorrelation(), 0.0001)
+
+		// Reset and test perfect negative correlation
+		ct.Reset()
+		for i := 0; i < 10; i++ {
+			ct.Add(float64(i), float64(9-i))
+		}
+		assert.InDelta(t, -1.0, ct.GetCorrelation(), 0.0001)
+	})
+
+	t.Run("No Correlation", func(t *testing.T) {
+		ct := baseline.NewCorrelationTracker()
+
+		// Independent variables should show no correlation
+		data := []struct{ x, y float64 }{
+			{1, 5}, {2, 2}, {3, 8}, {4, 1}, {5, 7},
+			{6, 3}, {7, 6}, {8, 4}, {9, 9}, {10, 0},
+		}
+		for _, d := range data {
+			ct.Add(d.x, d.y)
+		}
+		// Correlation should be close to 0
+		assert.InDelta(t, 0.0, ct.GetCorrelation(), 0.3)
+	})
+
+	t.Run("Strong Correlation Detection", func(t *testing.T) {
+		ct := baseline.NewCorrelationTracker()
+
+		// Add strongly correlated data
+		for i := 0; i < 10; i++ {
+			ct.Add(float64(i), float64(i)*2+1) // y = 2x + 1
+		}
+		assert.True(t, ct.IsStrongCorrelation(0.8))
+		assert.True(t, ct.IsStrongCorrelation(0.9))
+	})
+
+	t.Run("Weak Correlation Detection", func(t *testing.T) {
+		ct := baseline.NewCorrelationTracker()
+
+		// Add weakly correlated data with noise
+		for i := 0; i < 20; i++ {
+			noise := float64(i%3-1) * 2 // Adds some noise
+			ct.Add(float64(i), float64(i)+noise)
+		}
+		assert.True(t, ct.IsStrongCorrelation(0.7))
+		assert.False(t, ct.IsStrongCorrelation(0.99))
+	})
+
+	t.Run("Edge Cases", func(t *testing.T) {
+		ct := baseline.NewCorrelationTracker()
+
+		// Test single point
+		ct.Add(1.0, 1.0)
+		assert.Equal(t, 0.0, ct.GetCorrelation())
+
+		// Test constant x values
+		ct.Reset()
+		for i := 0; i < 5; i++ {
+			ct.Add(1.0, float64(i))
+		}
+		assert.Equal(t, 0.0, ct.GetCorrelation())
+
+		// Test constant y values
+		ct.Reset()
+		for i := 0; i < 5; i++ {
+			ct.Add(float64(i), 1.0)
+		}
+		assert.Equal(t, 0.0, ct.GetCorrelation())
+	})
+
+	t.Run("Concurrent Access", func(t *testing.T) {
+		ct := baseline.NewCorrelationTracker()
+		var wg sync.WaitGroup
+		n := 100
+
+		// Start multiple goroutines updating the correlation
+		for i := 0; i < n; i++ {
+			wg.Add(1)
+			go func(val float64) {
+				defer wg.Done()
+				ct.Add(val, val*2)
+				ct.GetCorrelation()
+				ct.IsStrongCorrelation(0.8)
+			}(float64(i))
+		}
+
+		wg.Wait()
+		// Should have perfect correlation y = 2x
+		assert.InDelta(t, 1.0, ct.GetCorrelation(), 0.0001)
+	})
+}
+
+func TestVarianceTrackerCorrelations(t *testing.T) {
+	t.Run("Packet-Byte Correlation", func(t *testing.T) {
+		vt := baseline.NewVarianceTracker()
+		defer vt.Reset() // Ensure cleanup
+
+		// Simulate correlated packet and byte counts
+		for i := 0; i < 10; i++ {
+			packets := float64(i * 100)
+			bytes := packets * 1500 // Assuming 1500 bytes per packet
+			burst := packets * 0.8  // Burst size somewhat correlated with packets
+			vt.AddCorrelatedMetrics(packets, bytes, burst)
+			// Add small sleep to prevent potential lock contention
+			time.Sleep(time.Millisecond)
+		}
+
+		correlations := vt.GetCorrelations()
+		assert.Greater(t, correlations["packet_byte_correlation"], 0.9,
+			"Packet and byte counts should be strongly correlated")
+	})
+
+	t.Run("Temporal Correlation", func(t *testing.T) {
+		vt := baseline.NewVarianceTracker()
+		defer vt.Reset() // Ensure cleanup
+
+		// Simulate gradually increasing traffic
+		for i := 0; i < 10; i++ {
+			packets := float64(i * 100)
+			bytes := packets * 1500
+			burst := packets * 0.8
+			vt.AddCorrelatedMetrics(packets, bytes, burst)
+			// Add small sleep to prevent potential lock contention
+			time.Sleep(time.Millisecond)
+		}
+
+		correlations := vt.GetCorrelations()
+		assert.Greater(t, correlations["temporal_correlation"], 0.8,
+			"Temporal correlation should be strong for gradually changing traffic")
+	})
+
+	t.Run("Burst Correlation", func(t *testing.T) {
+		vt := baseline.NewVarianceTracker()
+		defer vt.Reset() // Ensure cleanup
+
+		// Simulate traffic with varying burst patterns
+		for i := 0; i < 10; i++ {
+			packets := float64(i * 100)
+			bytes := packets * 1500
+			// Burst size less correlated with packets
+			burst := packets*0.5 + float64(i%3)*200
+			vt.AddCorrelatedMetrics(packets, bytes, burst)
+			// Add small sleep to prevent potential lock contention
+			time.Sleep(time.Millisecond)
+		}
+
+		correlations := vt.GetCorrelations()
+		assert.Greater(t, correlations["packet_burst_correlation"], 0.5,
+			"Packet and burst correlation should be moderate")
+		assert.Greater(t, correlations["byte_burst_correlation"], 0.5,
+			"Byte and burst correlation should be moderate")
+	})
+
+	t.Run("Reset Correlations", func(t *testing.T) {
+		vt := baseline.NewVarianceTracker()
+
+		// Add some correlated metrics
+		for i := 0; i < 5; i++ {
+			vt.AddCorrelatedMetrics(float64(i*100), float64(i*150), float64(i*80))
+			// Add small sleep to prevent potential lock contention
+			time.Sleep(time.Millisecond)
+		}
+
+		// Verify correlations exist
+		correlations := vt.GetCorrelations()
+		assert.NotEqual(t, 0.0, correlations["packet_byte_correlation"])
+
+		// Reset and verify correlations are cleared
+		vt.Reset()
+		correlations = vt.GetCorrelations()
+		assert.Equal(t, 0.0, correlations["packet_byte_correlation"])
+		assert.Equal(t, 0.0, correlations["packet_burst_correlation"])
+		assert.Equal(t, 0.0, correlations["byte_burst_correlation"])
+		assert.Equal(t, 0.0, correlations["temporal_correlation"])
 	})
 }
