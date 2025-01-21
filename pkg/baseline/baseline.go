@@ -439,10 +439,8 @@ type ProtocolStats struct {
 	BurstDetection     *VarianceTracker // For detecting traffic bursts
 	ConnectionDuration *EWMA            // Average connection duration
 
-	// Historical data
-	PacketCounts []uint64
-	ByteCounts   []uint64
-	Timestamps   []time.Time
+	// Historical data using circular buffers
+	HistoricalData *CircularBuffer // Stores historical packet and byte counts
 
 	// Protocol-specific thresholds
 	PacketThreshold float64 // Threshold for packet anomalies
@@ -718,6 +716,20 @@ func (m *Manager) getOrCreateProtocolStats(protocol string) *ProtocolStats {
 		stats = NewProtocolStats(m.config)
 		m.protocolStats[protocol] = stats
 	}
+
+	// Ensure HistoricalData is initialized
+	if stats.HistoricalData == nil {
+		// Calculate buffer size based on learning period and update interval
+		bufferSize := int(m.config.InitialLearningPeriod/m.config.UpdateInterval) * 2
+		if bufferSize < m.config.MinSamples {
+			bufferSize = m.config.MinSamples
+		}
+		if bufferSize < 100 {
+			bufferSize = 100 // Minimum buffer size
+		}
+		stats.HistoricalData = NewCircularBuffer(bufferSize)
+	}
+
 	return stats
 }
 
@@ -738,6 +750,23 @@ func (m *Manager) GetProtocolStats(protocol string) (*ProtocolStats, bool) {
 
 // NewProtocolStats creates a new ProtocolStats instance
 func NewProtocolStats(config Config) *ProtocolStats {
+	// Calculate buffer size based on learning period and update interval
+	// This ensures we can store enough data points for the learning period
+	const minBufferSize = 100 // Minimum buffer size to ensure we always have some capacity
+
+	bufferSize := int(config.InitialLearningPeriod/config.UpdateInterval) * 2
+	if bufferSize < config.MinSamples {
+		bufferSize = config.MinSamples
+	}
+	if bufferSize < minBufferSize {
+		bufferSize = minBufferSize
+	}
+
+	// Ensure buffer size is positive
+	if bufferSize <= 0 {
+		bufferSize = minBufferSize
+	}
+
 	return &ProtocolStats{
 		// Volume tracking
 		ShortTermVolume:  NewEWMA(config.ShortTermAlpha),
@@ -760,10 +789,8 @@ func NewProtocolStats(config Config) *ProtocolStats {
 		BurstDetection:     NewVarianceTracker(),
 		ConnectionDuration: NewEWMA(config.MediumTermAlpha),
 
-		// Historical data
-		PacketCounts: make([]uint64, 0),
-		ByteCounts:   make([]uint64, 0),
-		Timestamps:   make([]time.Time, 0),
+		// Historical data using circular buffer
+		HistoricalData: NewCircularBuffer(bufferSize),
 
 		// Default thresholds
 		PacketThreshold: config.AnomalyThreshold,
@@ -797,9 +824,11 @@ func (ps *ProtocolStats) UpdateStats(packets, bytes uint64, timestamp time.Time)
 	}
 
 	// Update historical data
-	ps.PacketCounts = append(ps.PacketCounts, packets)
-	ps.ByteCounts = append(ps.ByteCounts, bytes)
-	ps.Timestamps = append(ps.Timestamps, timestamp)
+	ps.HistoricalData.Add(DataPoint{
+		Timestamp:   timestamp,
+		PacketCount: packets,
+		ByteCount:   bytes,
+	})
 
 	// Update timestamp
 	ps.LastUpdated = timestamp
@@ -807,12 +836,11 @@ func (ps *ProtocolStats) UpdateStats(packets, bytes uint64, timestamp time.Time)
 
 // IsAnomaly checks if current metrics indicate an anomaly
 func (ps *ProtocolStats) IsAnomaly(packets, bytes uint64) bool {
-	// Check packet count anomaly
+	// Check immediate variance-based anomalies
 	if ps.PacketVariance.IsAnomaly(float64(packets), ps.PacketThreshold) {
 		return true
 	}
 
-	// Check byte count anomaly
 	if ps.ByteVariance.IsAnomaly(float64(bytes), ps.ByteThreshold) {
 		return true
 	}
@@ -822,12 +850,33 @@ func (ps *ProtocolStats) IsAnomaly(packets, bytes uint64) bool {
 		return true
 	}
 
+	// Check against historical patterns
+	points := ps.HistoricalData.GetPoints(time.Now().Add(-1 * time.Hour))
+	if len(points) > 0 {
+		var totalPackets, totalBytes uint64
+		for _, p := range points {
+			totalPackets += p.PacketCount
+			totalBytes += p.ByteCount
+		}
+
+		historicalAvgPackets := float64(totalPackets) / float64(len(points))
+		historicalAvgBytes := float64(totalBytes) / float64(len(points))
+
+		// Check if current values deviate significantly from historical averages
+		packetDeviation := math.Abs(float64(packets)-historicalAvgPackets) / historicalAvgPackets
+		byteDeviation := math.Abs(float64(bytes)-historicalAvgBytes) / historicalAvgBytes
+
+		if packetDeviation > ps.PacketThreshold || byteDeviation > ps.ByteThreshold {
+			return true
+		}
+	}
+
 	return false
 }
 
 // GetStats returns current statistics for the protocol
 func (ps *ProtocolStats) GetStats() map[string]float64 {
-	return map[string]float64{
+	stats := map[string]float64{
 		"short_term_volume":  ps.ShortTermVolume.GetValue(),
 		"medium_term_volume": ps.MediumTermVolume.GetValue(),
 		"long_term_volume":   ps.LongTermVolume.GetValue(),
@@ -838,6 +887,21 @@ func (ps *ProtocolStats) GetStats() map[string]float64 {
 		"packet_variance":    ps.PacketVariance.GetVariance(),
 		"byte_variance":      ps.ByteVariance.GetVariance(),
 	}
+
+	// Add historical metrics
+	points := ps.HistoricalData.GetPoints(time.Now().Add(-24 * time.Hour))
+	if len(points) > 0 {
+		var totalPackets, totalBytes uint64
+		for _, p := range points {
+			totalPackets += p.PacketCount
+			totalBytes += p.ByteCount
+		}
+		stats["historical_avg_packets"] = float64(totalPackets) / float64(len(points))
+		stats["historical_avg_bytes"] = float64(totalBytes) / float64(len(points))
+		stats["historical_points"] = float64(len(points))
+	}
+
+	return stats
 }
 
 // UpdateHealth updates the baseline health metrics

@@ -12,6 +12,9 @@ func init() {
 	gob.Register(&WindowManager{})
 	gob.Register(time.Month(1))
 	gob.Register(time.Weekday(0))
+	gob.Register(&CircularBuffer{})
+	gob.Register([]DataPoint{})
+	gob.Register(DataPoint{})
 }
 
 // CircularBuffer represents a fixed-size circular buffer for DataPoints
@@ -26,9 +29,18 @@ type CircularBuffer struct {
 
 // NewCircularBuffer creates a new circular buffer with given capacity
 func NewCircularBuffer(capacity int) *CircularBuffer {
+	// Ensure minimum capacity
+	if capacity <= 0 {
+		capacity = 100 // Default minimum capacity
+	}
+
 	return &CircularBuffer{
 		Buffer:   make([]DataPoint, capacity),
 		Capacity: capacity,
+		Head:     0,
+		Tail:     0,
+		Size:     0,
+		IsFull:   false,
 	}
 }
 

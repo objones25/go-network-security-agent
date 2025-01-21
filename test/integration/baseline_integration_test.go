@@ -191,4 +191,59 @@ func TestBaselineLearning(t *testing.T) {
 		// Business hours should show higher traffic
 		assert.Greater(t, tcpStats.MediumTermVolume.GetValue(), tcpStats.LongTermVolume.GetValue())
 	})
+
+	t.Run("Historical Data", func(t *testing.T) {
+		config := baseline.DefaultConfig()
+		config.InitialLearningPeriod = 2 * time.Second
+		config.UpdateInterval = 100 * time.Millisecond
+		config.MinSamples = 10
+
+		manager, err := baseline.NewManager(config)
+		require.NoError(t, err)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		err = manager.Start(ctx)
+		require.NoError(t, err)
+		defer manager.Stop()
+
+		// Add metrics with increasing values
+		baseTime := time.Now()
+		for i := 0; i < 20; i++ {
+			snapshot := capture.StatsSnapshot{
+				TotalPackets: uint64(100 + i*10),
+				TotalBytes:   uint64(1000 + i*100),
+				PacketsByProtocol: map[string]uint64{
+					"TCP": uint64(80 + i*8),
+					"UDP": uint64(20 + i*2),
+				},
+				BytesByProtocol: map[string]uint64{
+					"TCP": uint64(800 + i*80),
+					"UDP": uint64(200 + i*20),
+				},
+				LastUpdated: baseTime.Add(time.Duration(i) * 100 * time.Millisecond),
+			}
+			manager.AddMetrics(snapshot)
+			time.Sleep(50 * time.Millisecond)
+		}
+
+		// Wait for processing
+		time.Sleep(500 * time.Millisecond)
+
+		// Get TCP stats and verify historical data
+		tcpStats, ok := manager.GetProtocolStats("TCP")
+		require.True(t, ok)
+
+		stats := tcpStats.GetStats()
+		assert.Contains(t, stats, "historical_avg_packets")
+		assert.Contains(t, stats, "historical_avg_bytes")
+		assert.Contains(t, stats, "historical_points")
+		assert.Greater(t, stats["historical_points"], float64(0))
+
+		// Verify historical data is used in anomaly detection
+		lastNormalPackets := uint64(80 + 19*8)    // Last normal value from the loop
+		anomalousPackets := lastNormalPackets * 5 // 5x the last normal value
+		assert.True(t, tcpStats.IsAnomaly(anomalousPackets, anomalousPackets*10))
+	})
 }
