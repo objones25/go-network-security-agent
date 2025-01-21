@@ -177,6 +177,7 @@ type persistedState struct {
 	DailyPatterns   map[time.Weekday]*TimeStats
 	MonthlyPatterns map[time.Month]*TimeStats
 	LastCheckpoint  time.Time
+	Health          *BaselineHealth // Add health metrics to persisted state
 }
 
 func init() {
@@ -225,6 +226,16 @@ func validateState(state *persistedState) error {
 		return fmt.Errorf("invalid last checkpoint time")
 	}
 
+	// Validate health metrics if present
+	if state.Health != nil {
+		if state.Health.ProtocolCoverage == nil {
+			return fmt.Errorf("nil protocol coverage in health metrics")
+		}
+		if state.Health.TimeWindowCoverage == nil {
+			return fmt.Errorf("nil time window coverage in health metrics")
+		}
+	}
+
 	return nil
 }
 
@@ -262,6 +273,7 @@ func (m *Manager) Save() error {
 
 	// Take a snapshot of the state under lock
 	m.mu.RLock()
+	m.healthMu.RLock()
 	state := persistedState{
 		StartTime:       m.startTime,
 		SampleCount:     m.sampleCount,
@@ -271,7 +283,9 @@ func (m *Manager) Save() error {
 		DailyPatterns:   m.dailyPatterns,
 		MonthlyPatterns: m.monthlyPatterns,
 		LastCheckpoint:  time.Now(),
+		Health:          m.health,
 	}
+	m.healthMu.RUnlock()
 	m.mu.RUnlock()
 
 	// Encode state
@@ -366,6 +380,8 @@ func (m *Manager) Load() error {
 	}
 
 	m.mu.Lock()
+	m.healthMu.Lock()
+	defer m.healthMu.Unlock()
 	defer m.mu.Unlock()
 
 	// Initialize maps if they don't exist
@@ -391,6 +407,11 @@ func (m *Manager) Load() error {
 	m.dailyPatterns = state.DailyPatterns
 	m.monthlyPatterns = state.MonthlyPatterns
 	m.lastCheckpoint = state.LastCheckpoint
+
+	// Restore health metrics if available
+	if state.Health != nil {
+		m.health = state.Health
+	}
 
 	return nil
 }
@@ -557,12 +578,21 @@ func (m *Manager) run(ctx context.Context) {
 			m.processSnapshot(snapshot)
 		case <-ticker.C:
 			m.updateBaselines()
-		case <-checkpointTicker.C:
-			if err := m.Save(); err != nil {
-				log.Printf("Failed to save checkpoint: %v", err)
-			}
 		case <-healthTicker.C:
 			m.UpdateHealth()
+		default:
+			// Handle checkpoint ticker separately to avoid nil pointer dereference
+			if checkpointTicker != nil {
+				select {
+				case <-checkpointTicker.C:
+					if err := m.Save(); err != nil {
+						log.Printf("Failed to save checkpoint: %v", err)
+					}
+				default:
+				}
+			}
+			// Small sleep to prevent tight loop
+			time.Sleep(10 * time.Millisecond)
 		}
 	}
 }
@@ -578,17 +608,7 @@ func (m *Manager) processSnapshot(snapshot capture.StatsSnapshot) {
 	for proto, packetCount := range snapshot.PacketsByProtocol {
 		stats := m.getOrCreateProtocolStats(proto)
 		byteCount := snapshot.BytesByProtocol[proto]
-
-		// Update all protocol-specific stats
 		stats.UpdateStats(packetCount, byteCount, snapshot.LastUpdated)
-
-		// Check for anomalies if initialized
-		if m.isInitialized {
-			if stats.IsAnomaly(packetCount, byteCount) {
-				log.Printf("Anomaly detected for protocol %s: packets=%d, bytes=%d",
-					proto, packetCount, byteCount)
-			}
-		}
 	}
 
 	// Update time-based patterns
@@ -820,25 +840,26 @@ func (ps *ProtocolStats) GetStats() map[string]float64 {
 	}
 }
 
-// UpdateHealth updates baseline health metrics
+// UpdateHealth updates the baseline health metrics
 func (m *Manager) UpdateHealth() {
 	m.healthMu.Lock()
 	defer m.healthMu.Unlock()
 
+	// Get current state with read lock
+	m.mu.RLock()
+	sampleCount := m.sampleCount
 	now := time.Now()
+	m.mu.RUnlock()
 
-	// Calculate learning progress and phase
-	progress := float64(m.sampleCount) / float64(m.config.MinSamples)
-	if progress > 1.0 {
-		progress = 1.0
-	}
+	// Calculate learning progress as percentage of minimum samples
+	progress := math.Min(100.0, float64(sampleCount)/float64(m.config.MinSamples)*100.0)
 
-	// Determine learning phase
+	// Determine learning phase based on progress percentage
 	var learningPhase string
 	switch {
-	case progress < 0.3:
+	case progress < 30.0:
 		learningPhase = "Initial"
-	case progress < 1.0:
+	case progress < 100.0:
 		learningPhase = "Active"
 	default:
 		learningPhase = "Stable"
@@ -848,6 +869,17 @@ func (m *Manager) UpdateHealth() {
 	stability := m.calculateStability()
 	coverage := m.calculateCoverage()
 	maturity := m.calculateMaturity()
+
+	// Update health metrics
+	m.health.LearningProgress = progress
+	m.health.LearningPhase = learningPhase
+	m.health.DataPoints = sampleCount
+	m.health.LastUpdate = now
+
+	m.health.Confidence = (stability + coverage + maturity) / 3.0
+	m.health.Stability = stability
+	m.health.Coverage = coverage
+	m.health.Maturity = maturity
 
 	// Calculate statistical health
 	meanStability := m.calculateMeanStability()
@@ -873,16 +905,6 @@ func (m *Manager) UpdateHealth() {
 	dataQualityTrend := m.calculateDataQualityTrend()
 
 	// Update health metrics
-	m.health.LearningProgress = progress * 100
-	m.health.LearningPhase = learningPhase
-	m.health.DataPoints = m.sampleCount
-	m.health.LastUpdate = now
-
-	m.health.Confidence = (stability + coverage + maturity) / 3.0
-	m.health.Stability = stability
-	m.health.Coverage = coverage
-	m.health.Maturity = maturity
-
 	m.health.MeanStability = meanStability
 	m.health.VarianceStability = varianceStability
 	m.health.DistributionQuality = distributionQuality
@@ -1254,29 +1276,43 @@ func (m *Manager) identifyIssues() []string {
 	return issues
 }
 
-// calculateStability computes the stability score based on variance
+// calculateStability computes overall stability across all protocols
 func (m *Manager) calculateStability() float64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if len(m.protocolStats) == 0 {
+		return 0.0
+	}
+
+	// Calculate overall stability as average of protocol stabilities
 	var totalStability float64
 	var count int
-
 	for _, stats := range m.protocolStats {
 		if stats.ShortTermVolume.GetCount() > 0 {
-			// Calculate coefficient of variation
-			stdDev := math.Sqrt(stats.PacketVariance.GetVariance())
+			// Get variance and mean
+			variance := stats.PacketVariance.GetVariance()
 			mean := stats.ShortTermVolume.GetValue()
-			if mean > 0 {
-				cv := stdDev / mean
-				// Convert to stability score (lower CV = higher stability)
-				stability := 1.0 / (1.0 + cv)
-				totalStability += stability
-				count++
+
+			// Avoid division by zero and handle very small means
+			if mean < 1.0 {
+				mean = 1.0
 			}
+
+			// Calculate coefficient of variation with more sensitivity to changes
+			cv := 2.0 * math.Sqrt(variance) / mean
+
+			// Calculate stability with adjusted formula for better sensitivity
+			stability := math.Exp(-cv) // This gives us a value between 0 and 1
+			totalStability += stability
+			count++
 		}
 	}
 
 	if count == 0 {
-		return 0
+		return 0.0
 	}
+
 	return totalStability / float64(count)
 }
 

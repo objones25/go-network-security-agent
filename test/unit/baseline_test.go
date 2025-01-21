@@ -1144,6 +1144,7 @@ func TestVarianceTrackerCorrelations(t *testing.T) {
 func TestBaselineHealth(t *testing.T) {
 	t.Run("Initial Health State", func(t *testing.T) {
 		config := baseline.DefaultConfig()
+		config.PersistenceEnabled = false // Disable persistence
 		manager, err := baseline.NewManager(config)
 		require.NoError(t, err)
 
@@ -1160,7 +1161,8 @@ func TestBaselineHealth(t *testing.T) {
 
 	t.Run("Health Updates", func(t *testing.T) {
 		config := baseline.DefaultConfig()
-		config.MinSamples = 100 // Smaller value for testing
+		config.MinSamples = 100           // Smaller value for testing
+		config.PersistenceEnabled = false // Disable persistence
 		manager, err := baseline.NewManager(config)
 		require.NoError(t, err)
 
@@ -1195,6 +1197,9 @@ func TestBaselineHealth(t *testing.T) {
 		manager.UpdateHealth()
 
 		health := manager.GetHealth()
+		t.Logf("Health metrics - Progress: %.2f%%, Phase: %s, DataPoints: %d",
+			health.LearningProgress, health.LearningPhase, health.DataPoints)
+
 		assert.InDelta(t, 50.0, health.LearningProgress, 1.0)
 		assert.Equal(t, "Active", health.LearningPhase)
 		assert.Greater(t, health.Confidence, 0.0)
@@ -1211,6 +1216,7 @@ func TestBaselineHealth(t *testing.T) {
 
 	t.Run("Coverage Calculation", func(t *testing.T) {
 		config := baseline.DefaultConfig()
+		config.PersistenceEnabled = false // Disable persistence
 		manager, err := baseline.NewManager(config)
 		require.NoError(t, err)
 
@@ -1251,6 +1257,7 @@ func TestBaselineHealth(t *testing.T) {
 
 	t.Run("Stability Calculation", func(t *testing.T) {
 		config := baseline.DefaultConfig()
+		config.PersistenceEnabled = false // Disable persistence
 		manager, err := baseline.NewManager(config)
 		require.NoError(t, err)
 
@@ -1283,6 +1290,7 @@ func TestBaselineHealth(t *testing.T) {
 		manager.UpdateHealth()
 
 		health := manager.GetHealth()
+		t.Logf("Initial stability: %.4f", health.Stability)
 		assert.Greater(t, health.Stability, 0.8) // Should be very stable
 
 		// Add unstable data
@@ -1308,6 +1316,7 @@ func TestBaselineHealth(t *testing.T) {
 		manager.UpdateHealth()
 
 		newHealth := manager.GetHealth()
+		t.Logf("Final stability: %.4f", newHealth.Stability)
 		assert.Less(t, newHealth.Stability, health.Stability) // Should be less stable
 	})
 }
