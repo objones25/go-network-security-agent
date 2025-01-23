@@ -165,6 +165,9 @@ type Manager struct {
 	// Health metrics
 	health   *BaselineHealth
 	healthMu sync.RWMutex
+
+	// Current stats
+	currentStats *capture.StatsSnapshot
 }
 
 // persistedState represents the state to be saved/loaded
@@ -1480,4 +1483,30 @@ func (m *Manager) GetHealth() BaselineHealth {
 	m.healthMu.RLock()
 	defer m.healthMu.RUnlock()
 	return *m.health
+}
+
+// GetCurrentStats returns the most recent network statistics
+func (m *Manager) GetCurrentStats() *capture.StatsSnapshot {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.currentStats
+}
+
+// GetHourlyStats returns the statistics for a specific hour
+func (m *Manager) GetHourlyStats(hour int) *TimeWindowStats {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.hourlyPatterns[hour]
+}
+
+// GetAllProtocolStats returns all protocol statistics
+func (m *Manager) GetAllProtocolStats() map[string]*ProtocolStats {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	// Return a copy to prevent concurrent access issues
+	stats := make(map[string]*ProtocolStats, len(m.protocolStats))
+	for k, v := range m.protocolStats {
+		stats[k] = v
+	}
+	return stats
 }
