@@ -57,10 +57,10 @@ func (s *DashboardServer) setupRoutes() {
 
 	// Alert management endpoints
 	api.HandleFunc("/alerts", s.handleListAlerts).Methods("GET")
+	api.HandleFunc("/alerts/stats", s.handleGetStats).Methods("GET")
 	api.HandleFunc("/alerts/{id}", s.handleGetAlert).Methods("GET")
 	api.HandleFunc("/alerts/{id}/state", s.handleUpdateAlertState).Methods("PUT")
 	api.HandleFunc("/alerts/{id}/assign", s.handleAssignAlert).Methods("PUT")
-	api.HandleFunc("/alerts/stats", s.handleGetStats).Methods("GET")
 
 	// Metrics endpoint
 	s.Router.Handle("/metrics", promhttp.Handler())

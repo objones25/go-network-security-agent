@@ -26,6 +26,14 @@ alerts:
     notification: false
     desktop: false
     log: true
+  email:
+    enabled: true
+    server: ${SMTP_SERVER}
+    port: 587  # Hardcode the port since it's always 587 for Gmail TLS
+    username: ${SMTP_USERNAME}
+    recipients: 
+      - ${SMTP_RECIPIENT}
+    from_email: ${SMTP_FROM_EMAIL}
 
 dashboard:
   port: 3000
