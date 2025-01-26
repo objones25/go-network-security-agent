@@ -1,0 +1,12 @@
+{
+  "compilerOptions": {
+    "composite": true,
+    "tsBuildInfoFile": "./.node.tsbuildinfo",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "allowSyntheticDefaultImports": true,
+    "strict": true,
+    "skipLibCheck": true
+  },
+  "include": ["vite.config.ts"]
+}
